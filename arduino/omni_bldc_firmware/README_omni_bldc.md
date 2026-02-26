@@ -1,6 +1,7 @@
 # Omni BLDC (Arduino-Only) Integration
 
 This document covers the new omni-wheel BLDC integration path using:
+
 - Arduino Mega 2560
 - 4x BLD-515C drivers
 - 4x brushless geared motors
@@ -17,6 +18,7 @@ This path is intentionally open-loop for now (no PID/fusion in this phase).
 ## Serial Contract (ROS2 -> Arduino)
 
 ROS2 currently publishes:
+
 - `distance` in inches
 - `angle` in radians
 
@@ -29,6 +31,7 @@ Command lines accepted by Arduino:
 - `HELP`
 
 Arduino responses:
+
 - `ACK DA`
 - `ACK STOP`
 - `PONG`
@@ -38,14 +41,17 @@ Arduino responses:
 
 ## Mega 2560 Pinout (Per Driver)
 
-| Wheel | SV (PWM out) | DIR (`F/R`) | EN | BK | PG (input) |
-|------|---------------|-------------|----|----|------------|
-| FL | D2 | D22 | D30 | D34 | D18 |
-| FR | D3 | D23 | D31 | D35 | D19 |
-| RL | D5 | D24 | D32 | D36 | D20 |
-| RR | D6 | D25 | D33 | D37 | D21 |
+
+| Wheel | SV (PWM out) | DIR (`F/R`) | EN  | BK  | PG (input) |
+| ----- | ------------ | ----------- | --- | --- | ---------- |
+| FL    | D2           | D22         | D30 | D34 | D18        |
+| FR    | D3           | D23         | D31 | D35 | D19        |
+| RL    | D5           | D24         | D32 | D36 | D20        |
+| RR    | D6           | D25         | D33 | D37 | D21        |
+
 
 Shared wiring:
+
 - Mega `GND` to every driver signal `GND` (common reference required).
 - `SV` gets one RC low-pass per channel from each PWM pin.
 - `BK` is held inactive in firmware during phase-1.
@@ -54,6 +60,7 @@ Shared wiring:
 ## BLD-515C Wiring Groups
 
 From driver terminal groups:
+
 - Power: `VP`, `GND`
 - Motor phases: `MA`, `MB`, `MC`
 - Hall group: `GND`, `HA`, `HB`, `HC`, `+5V`
@@ -62,6 +69,7 @@ From driver terminal groups:
 - Outputs: `PG`, `ALM`, `+5V`
 
 For this firmware:
+
 - Arduino drives `F/R`, `EN`, `BK`, `SV`.
 - Arduino reads `PG`.
 - `ALM` is left unconnected in this phase.
@@ -69,10 +77,12 @@ For this firmware:
 ## RC Filter Guidance For SV
 
 Use one low-pass per `SV` channel:
+
 - PWM pin -> `R` series -> node -> `SV`
 - Node -> `C` to signal ground
 
 Starter values:
+
 - `R = 2.2k ohm`
 - `C = 0.1 uF` to `1.0 uF`
 
@@ -81,6 +91,7 @@ Tune RC cutoff so ripple is acceptable while command response remains fast enoug
 ## Basic Onboard Kinematics (Current Phase)
 
 Arduino computes:
+
 - `vx = k_d * distance * cos(angle)`
 - `vy = k_d * distance * sin(angle)`
 - `omega = k_a * angle`
@@ -88,6 +99,7 @@ Arduino computes:
 Then applies omni inverse kinematics to get wheel commands and maps to signed PWM.
 
 Global parameters are in the sketch for:
+
 - Board geometry
 - Wheel positions
 - Wheel radius
@@ -113,3 +125,4 @@ Global parameters are in the sketch for:
 - Camera + motor feedback fusion
 - Encoder/PG feedback in control loop
 - Advanced trajectory tracking
+
