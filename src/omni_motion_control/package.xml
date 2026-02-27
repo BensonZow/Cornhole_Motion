@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <!-- ROS package identity -->
+  <name>omni_motion_control</name>
+  <version>0.1.0</version>
+  <description>Omni kinematics and serial bridge nodes for Cornhole Motion.</description>
+  <maintainer email="cornholio@todo.todo">cornholio</maintainer>
+  <license>Apache-2.0</license>
+
+  <!-- Runtime dependencies required when this package is executed -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>diagnostic_msgs</exec_depend>
+  <exec_depend>python3-serial</exec_depend>
+
+  <!-- Optional dependencies used by tests and style checks -->
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <!-- ament_python means this ROS package is built from Python modules -->
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
