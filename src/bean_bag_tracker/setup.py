@@ -24,7 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'camera_listener = bean_bag_tracker.camera_listener:main'
+            'camera_listener = bean_bag_tracker.camera_listener:main',
+            'ros2_bag_sense_1 = bean_bag_tracker.ros2_bag_sense_1:main',
         ],
     },
 )

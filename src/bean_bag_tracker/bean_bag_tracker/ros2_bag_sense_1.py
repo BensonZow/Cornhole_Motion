@@ -18,7 +18,7 @@ class BeanBagTracker(Node):
         self.declare_parameter('hole_distance_inches', 10.0)
         self.declare_parameter('max_z_meters', 3.0)
         self.declare_parameter('color_topic', '/camera/color/image_raw')
-        self.declare_parameter('depth_topic', '/camera/aligned_depth_to_color/image_raw')
+        self.declare_parameter('depth_topic', '/camera/camera/depth/image_rect_raw')
         self.declare_parameter('camera_info_topic', '/camera/depth/camera_info')
         self.declare_parameter('result_topic', '/bean_bag_trajectory')
         self.declare_parameter('collection_timeout_sec', 2.0)
