@@ -4,6 +4,11 @@ https://docs.ros.org/en/jazzy/Installation/Alternatives/Ubuntu-Development-Setup
 Realsense 
 https://github.com/realsenseai/realsense-ros?tab=readme-ov-file
 
+    reset camera
+   ros2 launch realsense2_camera rs_launch.py initial_reset:=true
+
+
+
 Update dependencies 
 rosdep install --from-paths src --ignore-src -r -y
 

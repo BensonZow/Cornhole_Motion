@@ -2,3 +2,7 @@
 build/*
 install/*
 log/*
+# Ignore all python cache folders
+**/__pycache__/
+# Ignore all compiled python files
+*.pyc

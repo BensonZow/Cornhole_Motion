@@ -6,7 +6,7 @@ from typing import List
 import rclpy
 from geometry_msgs.msg import Twist, Vector3
 from rclpy.node import Node
-from std_msgs.msg import Int16MultiArray
+from std_msgs.msg import Int16MultiArray , Float32MultiArray
 
 
 class OmniKinematicsNode(Node):
@@ -17,7 +17,7 @@ class OmniKinematicsNode(Node):
 
         # Topic names and control settings are parameters so they can be tuned
         # from launch files without editing this source code.
-        self.declare_parameter('target_topic', '/motion/target_da')
+        self.declare_parameter('target_topic', '/bean_bag_trajectory')
         self.declare_parameter('wheel_cmd_topic', '/motion/wheel_cmd')
         self.declare_parameter('robot_cmd_topic', '/motion/robot_cmd')
         self.declare_parameter('control_rate_hz', 50.0)
@@ -41,9 +41,11 @@ class OmniKinematicsNode(Node):
         robot_cmd_topic = self.get_parameter('robot_cmd_topic').value
 
         # Input: target distance/angle.
+
         self.target_sub = self.create_subscription(
-            Vector3, target_topic, self.target_callback, 1
+            Float32MultiArray, target_topic, self.target_callback, 1
         )
+
         # Outputs: wheel-level command and body-level command for debugging/tools.
         self.wheel_pub = self.create_publisher(Int16MultiArray, wheel_cmd_topic, 1)
         self.robot_pub = self.create_publisher(Twist, robot_cmd_topic, 1)
@@ -64,8 +66,8 @@ class OmniKinematicsNode(Node):
 
     def target_callback(self, msg: Vector3) -> None:
         # Store the newest target and timestamp for timeout safety handling.
-        self.latest_distance_in = float(msg.x)
-        self.latest_angle_rad = float(msg.y)
+        self.latest_distance_in = float(msg.data[0])
+        self.latest_angle_rad = float(msg.data[1])
         self.last_target_time = self.get_clock().now()
 
     def control_loop(self) -> None:
