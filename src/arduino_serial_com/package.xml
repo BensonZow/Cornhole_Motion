@@ -4,7 +4,7 @@
   <name>arduino_serial_com</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
-  <maintainer email="cornholio.com">cornholio</maintainer>
+  <maintainer email="corn@gmail.com">cornholio</maintainer>
   <license>TODO: License declaration</license>
 
   <depend>rclpy</depend>

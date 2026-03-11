@@ -7,7 +7,7 @@ class SerialSenderNode(Node):
     def __init__(self):
         super().__init__('serial_sender_node')
         # Configure serial port (match Arduino baud rate)
-        self.serial_port = serial.Serial('/dev/ttyACM0', 9600, timeout=1)
+        self.serial_port = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
         
         # Subscribe to a ROS topic
         self.subscription = self.create_subscription(
