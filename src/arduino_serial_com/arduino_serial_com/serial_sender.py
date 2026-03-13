@@ -7,8 +7,7 @@ class SerialSenderNode(Node):
     def __init__(self):
         super().__init__('serial_sender_node')
         # Configure serial port (match Arduino baud rate)
-        self.serial_port = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
-        
+               
         # Subscribe to a ROS topic
         self.subscription = self.create_subscription(
             String,
@@ -19,7 +18,7 @@ class SerialSenderNode(Node):
 
     def listener_callback(self, msg):
         # Write data to serial port
-        self.serial_port.write(msg.data.encode('utf-8'))
+        #self.serial_port.write(msg.data.encode('utf-8'))
         self.get_logger().info(f'Sent to Arduino: "{msg.data}"')
 
 def main(args=None):
@@ -35,4 +34,13 @@ def main(args=None):
         rclpy.shutdown()
 
 if __name__ == '__main__':
+    
     main()
+    serial_port = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
+    
+    while(True):
+
+        msg = 'Motor: FWD , PWM = 30 '
+        serial.write(msg.encode('utf-8'))
+        
+
