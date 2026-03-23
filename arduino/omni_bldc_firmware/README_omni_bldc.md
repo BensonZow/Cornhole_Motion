@@ -1,128 +1,94 @@
 # Omni BLDC (Arduino-Only) Integration
 
-This document covers the new omni-wheel BLDC integration path using:
+This document covers omni-wheel BLDC integration using:
 
 - Arduino Mega 2560
 - 4x BLD-515C drivers
 - 4x brushless geared motors
-- ROS2 output (`distance`, `angle`) sent to Arduino over USB serial
-
-This path is intentionally open-loop for now (no PID/fusion in this phase).
+- Host (e.g. ROS2) can send `distance` (inches) and `angle` (radians) over USB serial
 
 ## Firmware
 
-- Sketch: `firmware/omni_bldc_firmware/omni_bldc_firmware.ino`
+- Sketch: [omni_bldc_firmware.ino](omni_bldc_firmware.ino)
 - Serial baud: `115200`
-- Control mode: `SV` speed command via PWM+RC, with `F/R`, `EN`, and `BK`.
+- **SV**: PWM + RC low-pass → analog speed command  
+- **EN**: digital output (sketch uses `HIGH` = enable when moving—match your wiring to the driver)  
+- **F/R** and **BK**: Mega pins wired **directly** to the driver; see pin-mode behavior below.
 
-## Serial Contract (ROS2 -> Arduino)
+## F/R and BK pin behavior (BLD-515C-style)
 
-ROS2 currently publishes:
+The driver text describes **GND** vs **not connected** inputs. The sketch emulates that **without external transistors**:
 
-- `distance` in inches
-- `angle` in radians
+| Meaning on driver | Mega configuration |
+| ----------------- | ------------------- |
+| Not pulling to GND (“open” / forward / brake released while running) | `pinMode(pin, INPUT_PULLUP)` |
+| Line grounded (reverse / brake asserted) | `pinMode(pin, OUTPUT); digitalWrite(pin, LOW)` |
 
-Command lines accepted by Arduino:
+**Do not** drive **OUTPUT HIGH** on F/R or BK: that sources 5 V into the input and may violate the driver’s intended use.
 
-- `DA <distance_in> <angle_rad>`
-  - Example: `DA 15.2 -0.37`
-- `STOP`
-- `PING`
-- `HELP`
+**Caveat:** `INPUT_PULLUP` is a **weak** pull-up to Vcc (~20–50 kΩ), not a true open circuit. Confirm on hardware that the BLD-515C accepts this; if not, use external open-collector buffering.
 
-Arduino responses:
+Constants in the sketch: `BRAKE_WHEN_STOPPED` (default **true**—assert BK when stopped), `FR_EN_OFF_DELAY_US` (EN off before F/R change).
 
-- `ACK DA`
-- `ACK STOP`
-- `PONG`
-- `ERR ...`
-- `WATCHDOG STOP` when command stream times out
-- `PG <fl_count> <fr_count> <rl_count> <rr_count>` telemetry
+## Serial contract (host → Arduino)
 
-## Mega 2560 Pinout (Per Driver)
+One maneuver per line, **IDLE only** (lines are ignored while a move is running):
 
+- Format: `distance_in,angle_rad` then newline  
+  - Example: `6.0,0.0` — 6 inches along angle 0 (robot +X).
 
-| Wheel | SV (PWM out) | DIR (`F/R`) | EN  | BK  | PG (input) |
-| ----- | ------------ | ----------- | --- | --- | ---------- |
-| FL    | D2           | D22         | D30 | D34 | D18        |
-| FR    | D3           | D23         | D31 | D35 | D19        |
-| RL    | D5           | D24         | D32 | D36 | D20        |
-| RR    | D6           | D25         | D33 | D37 | D21        |
+Responses include: `ACK MOVE`, `ACK DONE`, `ERR BAD_LINE`, `ERR TIMEOUT`, `ERR CMD_OVERFLOW`.
 
+Optional: set `#define DEBUG_TELEMETRY 1` for periodic `PG` total counts when idle.
+
+## Mega 2560 pinout (per driver)
+
+| Wheel | SV (PWM out) | F/R (Mega → driver) | EN  | BK (Mega → driver) | PG (input) |
+| ----- | ------------ | ------------------- | --- | ------------------ | ---------- |
+| FL    | D2           | D22                 | D30 | D34                | D18        |
+| FR    | D3           | D23                 | D31 | D35                | D19        |
+| RL    | D5           | D24                 | D32 | D36                | D20        |
+| RR    | D6           | D25                 | D33 | D37                | D21        |
 
 Shared wiring:
 
-- Mega `GND` to every driver signal `GND` (common reference required).
-- `SV` gets one RC low-pass per channel from each PWM pin.
-- `BK` is held inactive in firmware during phase-1.
-- `ALM` is not used in phase-1.
+- Mega **GND** to every driver signal **GND** (common reference required).
+- **SV**: one RC low-pass per channel from PWM pin to driver **SV**.
+- **ALM** not used in this sketch unless you add handling.
 
-## BLD-515C Wiring Groups
-
-From driver terminal groups:
+## BLD-515C wiring groups
 
 - Power: `VP`, `GND`
 - Motor phases: `MA`, `MB`, `MC`
-- Hall group: `GND`, `HA`, `HB`, `HC`, `+5V`
+- Hall: `GND`, `HA`, `HB`, `HC`, `+5V`
 - Control: `GND`, `F/R`, `EN`, `BK`
-- Speed input: `SV`
+- Speed: `SV`
 - Outputs: `PG`, `ALM`, `+5V`
 
-For this firmware:
+## RC filter guidance for SV
 
-- Arduino drives `F/R`, `EN`, `BK`, `SV`.
-- Arduino reads `PG`.
-- `ALM` is left unconnected in this phase.
+- PWM pin → series `R` → node → `SV`
+- Node → `C` to signal ground
 
-## RC Filter Guidance For SV
+Starter values: `R = 2.2 kΩ`, `C = 0.1–1.0 µF`.
 
-Use one low-pass per `SV` channel:
+## Control summary
 
-- PWM pin -> `R` series -> node -> `SV`
-- Node -> `C` to signal ground
+- Closed-loop **scalar distance PID** along the commanded direction; **angle** sets direction only (`omega = 0` body command).
+- Odometry from **PG** pulse counts and **F/R** sense (forward vs reverse).
+- Tune `MOTOR_POLE_PAIRS`, PID gains, and geometry in the sketch.
 
-Starter values:
+## Bring-up procedure
 
-- `R = 2.2k ohm`
-- `C = 0.1 uF` to `1.0 uF`
+1. One driver + one motor first; common ground.
+2. Upload sketch; Serial Monitor `115200`.
+3. Send a short move, e.g. `1.0,0.0` then newline; expect `ACK MOVE` then `ACK DONE` (or adjust PID/timing if it times out).
+4. Confirm direction: forward uses F/R “open” (`INPUT_PULLUP`); reverse grounds F/R.
+5. Confirm brake: with `BRAKE_WHEN_STOPPED` true, motors stopped should assert BK (grounded).
+6. Repeat per channel, then all four.
 
-Tune RC cutoff so ripple is acceptable while command response remains fast enough.
+## Deferred / optional
 
-## Basic Onboard Kinematics (Current Phase)
-
-Arduino computes:
-
-- `vx = k_d * distance * cos(angle)`
-- `vy = k_d * distance * sin(angle)`
-- `omega = k_a * angle`
-
-Then applies omni inverse kinematics to get wheel commands and maps to signed PWM.
-
-Global parameters are in the sketch for:
-
-- Board geometry
-- Wheel positions
-- Wheel radius
-- Gains and limits
-- Control and watchdog timing
-
-## Bring-Up Procedure
-
-1. Power only one driver + one motor first.
-2. Verify common ground between Mega and driver logic ground.
-3. Upload sketch and open Serial Monitor at `115200`.
-4. Send `PING` and verify `PONG`.
-5. Send small command: `DA 2.0 0.0`.
-6. Confirm expected wheel direction and smooth response.
-7. Send `STOP` and verify immediate stop.
-8. Unplug USB or stop streaming commands; verify `WATCHDOG STOP`.
-9. Repeat for each channel.
-10. Connect all four drivers after single-channel behavior is confirmed.
-
-## Deferred Items
-
-- Closed-loop PID
-- Camera + motor feedback fusion
-- Encoder/PG feedback in control loop
-- Advanced trajectory tracking
-
+- `DEBUG_TELEMETRY` / `ALM` handling
+- PWM-modulated BK for variable braking (hardware-dependent)
+- EN polarity alignment if your wiring uses “grounded = run” literally
