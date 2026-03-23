@@ -5,10 +5,13 @@ from rclpy.time import Time
 import cv2
 import numpy as np
 import math
+import serial
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Float32MultiArray
 import message_filters
+
+serial_port = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
 
 class BeanBagTracker(Node):
     def __init__(self):
@@ -214,8 +217,14 @@ class BeanBagTracker(Node):
         # Publish as Float32MultiArray
         msg = Float32MultiArray()
         msg.data = [float(distance), float(angle)]
+        dist = str(distance)
+        ang = str(angle)
+        send_msg = dist + "," + ang
         self.publisher.publish(msg)
         self.get_logger().info(f'Published: distance={distance:.2f} in, angle={angle:.3f} rad')
+
+        serial_port.write(send_msg.encode('utf-8'))
+
 
     def start_timeout_timer(self):
         """Start or restart the timeout timer for collection."""
