@@ -17,16 +17,14 @@ This document covers omni-wheel BLDC integration using:
 
 ## F/R and BK pin behavior (BLD-515C-style)
 
-The driver text describes **GND** vs **not connected** inputs. The sketch emulates that **without external transistors**:
+The driver text describes **GND** vs **not connected** for some lines. This sketch drives **F/R** and **BK** as **push-pull outputs** from the Mega:
 
 | Meaning on driver | Mega configuration |
-| ----------------- | ------------------- |
-| Not pulling to GND (“open” / forward / brake released while running) | `pinMode(pin, INPUT_PULLUP)` |
+| ----------------- | ------------------ |
+| Not grounding the line (forward / brake released while running) | `pinMode(pin, OUTPUT); digitalWrite(pin, HIGH)` |
 | Line grounded (reverse / brake asserted) | `pinMode(pin, OUTPUT); digitalWrite(pin, LOW)` |
 
-**Do not** drive **OUTPUT HIGH** on F/R or BK: that sources 5 V into the input and may violate the driver’s intended use.
-
-**Caveat:** `INPUT_PULLUP` is a **weak** pull-up to Vcc (~20–50 kΩ), not a true open circuit. Confirm on hardware that the BLD-515C accepts this; if not, use external open-collector buffering.
+**Caveat:** **OUTPUT HIGH** sources about **5 V** on the pin. That is **not** the same as the manual’s “do not connect” for forward. Only use this wiring if the BLD-515C control inputs tolerate a logic high; otherwise use open-collector buffering or level shifting per the datasheet.
 
 Constants in the sketch: `BRAKE_WHEN_STOPPED` (default **true**—assert BK when stopped), `FR_EN_OFF_DELAY_US` (EN off before F/R change).
 
@@ -83,8 +81,8 @@ Starter values: `R = 2.2 kΩ`, `C = 0.1–1.0 µF`.
 1. One driver + one motor first; common ground.
 2. Upload sketch; Serial Monitor `115200`.
 3. Send a short move, e.g. `1.0,0.0` then newline; expect `ACK MOVE` then `ACK DONE` (or adjust PID/timing if it times out).
-4. Confirm direction: forward uses F/R “open” (`INPUT_PULLUP`); reverse grounds F/R.
-5. Confirm brake: with `BRAKE_WHEN_STOPPED` true, motors stopped should assert BK (grounded).
+4. Confirm direction: forward drives F/R **HIGH**; reverse drives F/R **LOW** (ground).
+5. Confirm brake: with `BRAKE_WHEN_STOPPED` true, motors stopped should drive BK **LOW** (grounded).
 6. Repeat per channel, then all four.
 
 ## Deferred / optional
