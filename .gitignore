@@ -1,3 +1,6 @@
+# Python virtual environment
+.venv/
+
 # ROS 2 workspace artifacts
 build/*
 install/*

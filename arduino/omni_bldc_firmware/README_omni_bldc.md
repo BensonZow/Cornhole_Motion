@@ -30,14 +30,38 @@ Constants in the sketch: `BRAKE_WHEN_STOPPED` (default **true**—assert BK when
 
 ## Serial contract (host → Arduino)
 
-One maneuver per line, **IDLE only** (lines are ignored while a move is running):
+### Move command (IDLE only)
 
 - Format: `distance_in,angle_rad` then newline  
   - Example: `6.0,0.0` — 6 inches along angle 0 (robot +X).
+- On success the sketch prints **`ACK MOVE`** immediately, then runs closed-loop control until **`ACK DONE`** or an error.
 
-Responses include: `ACK MOVE`, `ACK DONE`, `ERR BAD_LINE`, `ERR TIMEOUT`, `ERR CMD_OVERFLOW`.
+### Other commands (IDLE)
 
-Optional: set `#define DEBUG_TELEMETRY 1` for periodic `PG` total counts when idle.
+- `PING` → `PONG`
+- `HELP` → short command summary
+- `STATUS` → one line: `STATUS armed drive` then twelve fields matching **`OUT`** below (`armed` = 1 while `STATE_MOVING`; `drive` = 1 if any wheel has non-zero SV duty)
+- `STOP` → `ACK STOP` (motors already idle)
+
+### While moving (`STATE_MOVING`)
+
+- Only **`STOP`** is accepted; it aborts the move, disables motors, and prints **`ACK STOP`**. Other serial lines are discarded.
+
+### Responses and telemetry
+
+- **`ACK MOVE`**, **`ACK DONE`**, **`ACK STOP`**, **`ERR BAD_LINE`**, **`ERR TIMEOUT`**, **`ERR CMD_OVERFLOW`**
+- Every **`OUT_TELEMETRY_PERIOD_MS`** (default 2000 ms): **`PG`** cumulative pulse totals, then **`OUT`** — last **SV PWM duty** (0–255) for FL, FR, RL, RR, then **direction** (1 = forward / F/R HIGH), then **EN intent** (1 = enabled), matching the firmware’s last applied outputs.
+
+Optional: set `#define DEBUG_TELEMETRY 1` for faster periodic **`PG`** lines when **IDLE** only (in addition to the 2 s `PG`+`OUT` block).
+
+## Status outputs (motion visibility)
+
+| Pin            | Mega | Level | Meaning                                      |
+| -------------- | ---- | ----- | -------------------------------------------- |
+| `STATUS_ARMED` | D7   | HIGH  | Closed-loop move running (`STATE_MOVING`)    |
+| `STATUS_DRIVE` | D8   | HIGH  | Any wheel has non-zero SV duty               |
+
+Idle / stopped: both LOW. 5 V logic; level-shift if feeding 3.3 V systems.
 
 ## Mega 2560 pinout (per driver)
 

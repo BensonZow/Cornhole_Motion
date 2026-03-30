@@ -2,6 +2,7 @@
 // direction (F/R), enable, brake, and PG (pulse) feedback per wheel.
 #include <Arduino.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifndef M_PI
@@ -44,8 +45,15 @@
 #define RL 2
 #define RR 3
 
-// 1 = periodic raw PG pulse totals on Serial when IDLE (verbose; avoid during MOVING).
+// Status outputs (Mega digital pins; not used by motor wiring in this design)
+const uint8_t STATUS_PIN_ARMED = 7;   // HIGH while closed-loop move is running (STATE_MOVING)
+const uint8_t STATUS_PIN_DRIVE = 8;   // HIGH while any wheel has non-zero SV PWM duty
+
+// 1 = periodic raw PG pulse totals on Serial when IDLE (fast rate; optional).
 #define DEBUG_TELEMETRY 0
+
+// PG totals + OUT (PWM/DIR/EN snapshot) on Serial at this interval (IDLE and MOVING).
+const unsigned long OUT_TELEMETRY_PERIOD_MS = 2000;
 
 // Pin bundle per wheel: must match your Mega wiring.
 struct DriverPins {
@@ -109,6 +117,8 @@ const unsigned long CONTROL_PERIOD_MS = 20;
 const unsigned long TELEMETRY_PERIOD_MS = 200;
 #endif
 
+unsigned long lastOutTelemMillis = 0;
+
 // HIGH here means "enable pin driven high to run" — flip if your driver is inverted.
 const bool EN_ACTIVE_LEVEL = HIGH;
 
@@ -164,6 +174,10 @@ uint8_t cmdLen = 0;
 // Tracks last F/R applied per wheel so we only sequence EN off when dir flips.
 static bool lastDirForward[NUM_WHEELS] = {true, true, true, true};
 
+// Last SV duty and EN state applied (for Serial OUT / STATUS); DIR uses lastDirForward.
+uint8_t lastSvDuty[NUM_WHEELS] = {0, 0, 0, 0};
+uint8_t lastEnOn[NUM_WHEELS] = {0, 0, 0, 0};
+
 // Drive line high: used for "forward" / "brake released" on driver inputs that need it.
 static inline void driverInputRelease(uint8_t pin) {
   pinMode(pin, OUTPUT);
@@ -195,17 +209,77 @@ void isrPgFR() { pgPulseTotal[FR]++; }
 void isrPgRL() { pgPulseTotal[RL]++; }
 void isrPgRR() { pgPulseTotal[RR]++; }
 
+void updateStatusOutputs() {
+  digitalWrite(STATUS_PIN_ARMED, (moveState == STATE_MOVING) ? HIGH : LOW);
+  bool anyDrive = false;
+  for (uint8_t i = 0; i < NUM_WHEELS; i++) {
+    if (lastSvDuty[i] > 0) {
+      anyDrive = true;
+      break;
+    }
+  }
+  digitalWrite(STATUS_PIN_DRIVE, anyDrive ? HIGH : LOW);
+}
+
+void printWheelOutputLine() {
+  Serial.print(F("OUT "));
+  for (uint8_t i = 0; i < NUM_WHEELS; i++) {
+    if (i) Serial.print(' ');
+    Serial.print(lastSvDuty[i]);
+  }
+  for (uint8_t i = 0; i < NUM_WHEELS; i++) {
+    Serial.print(' ');
+    Serial.print(lastDirForward[i] ? 1 : 0);
+  }
+  for (uint8_t i = 0; i < NUM_WHEELS; i++) {
+    Serial.print(' ');
+    Serial.print(lastEnOn[i]);
+  }
+  Serial.println();
+}
+
+void printStatusLine() {
+  bool anyDrive = false;
+  for (uint8_t i = 0; i < NUM_WHEELS; i++) {
+    if (lastSvDuty[i] > 0) {
+      anyDrive = true;
+      break;
+    }
+  }
+  Serial.print(F("STATUS "));
+  Serial.print((moveState == STATE_MOVING) ? 1 : 0);
+  Serial.print(' ');
+  Serial.print(anyDrive ? 1 : 0);
+  Serial.print(' ');
+  for (uint8_t i = 0; i < NUM_WHEELS; i++) {
+    if (i) Serial.print(' ');
+    Serial.print(lastSvDuty[i]);
+  }
+  for (uint8_t i = 0; i < NUM_WHEELS; i++) {
+    Serial.print(' ');
+    Serial.print(lastDirForward[i] ? 1 : 0);
+  }
+  for (uint8_t i = 0; i < NUM_WHEELS; i++) {
+    Serial.print(' ');
+    Serial.print(lastEnOn[i]);
+  }
+  Serial.println();
+}
+
 // Safe stop: disable drivers, PWM zero, optional brake.
 void stopAllMotors() {
   for (uint8_t i = 0; i < NUM_WHEELS; i++) {
     digitalWrite(kPins[i].en, !EN_ACTIVE_LEVEL);
     analogWrite(kPins[i].svPwm, 0);
+    lastSvDuty[i] = 0;
+    lastEnOn[i] = 0;
     if (BRAKE_WHEN_STOPPED) {
       driverInputGround(kPins[i].bkPin);
     } else {
       driverInputRelease(kPins[i].bkPin);
     }
   }
+  updateStatusOutputs();
 }
 
 // Read actual F/R pin state so odometry sign matches commanded wheel direction.
@@ -257,6 +331,9 @@ void applyWheelCommand(uint8_t index, int signedCmd) {
 
   digitalWrite(kPins[index].en, (magnitude > 0) ? EN_ACTIVE_LEVEL : !EN_ACTIVE_LEVEL);
   analogWrite(kPins[index].svPwm, magnitude);
+
+  lastSvDuty[index] = (uint8_t)magnitude;
+  lastEnOn[index] = (magnitude > 0) ? 1 : 0;
 }
 
 // Body twist (vx, vy, omega) -> each wheel rad/s for this omni layout, then PWM.
@@ -404,21 +481,48 @@ bool runControlTick() {
 }
 
 // Parse "float,float" from a single line (distance inches, angle radians).
+// Uses strtod (AVR sscanf %f is unreliable).
 static bool parseCommaPair(const char *line, float *outD, float *outA) {
-  if (strchr(line, ',') == nullptr) return false;
-  float d = 0.0f;
-  float a = 0.0f;
-  if (sscanf(line, "%f,%f", &d, &a) != 2) return false;
-  if (!isfinite(d) || !isfinite(a)) return false;
-  *outD = d;
-  *outA = a;
-  return true;
+  const char *p = line;
+  char *end1 = NULL;
+  double d = strtod(p, &end1);
+  if (end1 == p) return false;
+  p = end1;
+  if (*p != ',') return false;
+  p++;
+  char *end2 = NULL;
+  double a = strtod(p, &end2);
+  if (end2 == p) return false;
+  *outD = (float)d;
+  *outA = (float)a;
+  return isfinite(*outD) && isfinite(*outA);
 }
 
 // Called when a full line arrived in IDLE: validate, init mission, start MOVING.
 void tryProcessIdleLine() {
   if (cmdLen == 0) return;
   cmdBuf[cmdLen] = '\0';
+
+  if (strcmp(cmdBuf, "PING") == 0) {
+    Serial.println(F("PONG"));
+    cmdLen = 0;
+    return;
+  }
+  if (strcmp(cmdBuf, "HELP") == 0) {
+    Serial.println(F("distance_in,angle_rad | PING | STATUS | STOP"));
+    cmdLen = 0;
+    return;
+  }
+  if (strcmp(cmdBuf, "STATUS") == 0) {
+    printStatusLine();
+    cmdLen = 0;
+    return;
+  }
+  if (strcmp(cmdBuf, "STOP") == 0) {
+    Serial.println(F("ACK STOP"));
+    cmdLen = 0;
+    return;
+  }
 
   float dIn = 0.0f;
   float aRad = 0.0f;
@@ -452,6 +556,7 @@ void tryProcessIdleLine() {
   lastControlMillis = moveStartMillis - CONTROL_PERIOD_MS;
 
   Serial.println(F("ACK MOVE"));
+  updateStatusOutputs();
   cmdLen = 0;
 }
 
@@ -479,18 +584,39 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(kPins[RL].pg), isrPgRL, RISING);
   attachInterrupt(digitalPinToInterrupt(kPins[RR].pg), isrPgRR, RISING);
 
+  pinMode(STATUS_PIN_ARMED, OUTPUT);
+  pinMode(STATUS_PIN_DRIVE, OUTPUT);
+  digitalWrite(STATUS_PIN_ARMED, LOW);
+  digitalWrite(STATUS_PIN_DRIVE, LOW);
+
   stopAllMotors();
 
-  Serial.println(F("Omni BLDC: send distance_in,angle_rad then newline (IDLE only)"));
+  Serial.println(F("Omni BLDC: distance_in,angle_rad | PING | STATUS | STOP"));
+  Serial.println(F("Telemetry: PG + OUT every 2s; STATUS on demand"));
 }
 
 void loop() {
-  // Drain UART: in MOVING, consume and discard to end of line (ignore commands).
+  // Drain UART: in MOVING, only STOP is honored; other lines discarded.
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
     if (moveState == STATE_MOVING) {
       if (c == '\n' || c == '\r') {
-        /* line end discarded */
+        if (cmdLen > 0) {
+          cmdBuf[cmdLen] = '\0';
+          if (strcmp(cmdBuf, "STOP") == 0) {
+            stopAllMotors();
+            moveState = STATE_IDLE;
+            pidIntegral = 0.0f;
+            pidLastErr = 0.0f;
+            pidLastUs = 0;
+            Serial.println(F("ACK STOP"));
+          }
+          cmdLen = 0;
+        }
+      } else if (cmdLen < CMD_BUF_SIZE - 1) {
+        cmdBuf[cmdLen++] = c;
+      } else {
+        cmdLen = 0;
       }
       continue;
     }
@@ -516,6 +642,7 @@ void loop() {
       pidLastErr = 0.0f;
       pidLastUs = 0;
       Serial.println(F("ERR TIMEOUT"));
+      updateStatusOutputs();
     }
   }
 
@@ -539,4 +666,25 @@ void loop() {
     Serial.println(t3);
   }
 #endif
+
+  if (now - lastOutTelemMillis >= OUT_TELEMETRY_PERIOD_MS) {
+    lastOutTelemMillis = now;
+    noInterrupts();
+    unsigned long t0 = pgPulseTotal[FL];
+    unsigned long t1 = pgPulseTotal[FR];
+    unsigned long t2 = pgPulseTotal[RL];
+    unsigned long t3 = pgPulseTotal[RR];
+    interrupts();
+    Serial.print(F("PG "));
+    Serial.print(t0);
+    Serial.print(' ');
+    Serial.print(t1);
+    Serial.print(' ');
+    Serial.print(t2);
+    Serial.print(' ');
+    Serial.println(t3);
+    printWheelOutputLine();
+  }
+
+  updateStatusOutputs();
 }
