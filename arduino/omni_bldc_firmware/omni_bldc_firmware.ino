@@ -32,8 +32,9 @@
 // - Caveat: manual forward is "do not connect"; driving HIGH sources ~5V and is
 //   not a true open circuit—only use if the driver inputs tolerate logic high.
 // - BK: brake asserted when line grounded (OUTPUT LOW); released when HIGH.
-// - EN: manual says "EN grounded = run"; this sketch keeps EN_ACTIVE_LEVEL HIGH
-//   when enabling (your wiring). Change EN_ACTIVE_LEVEL if your board inverts.
+// - EN: BLD-515C manual "EN grounded = run". If a buffer/inverter sits between
+//   Mega and driver, the Mega pin level that enables motion may be HIGH — set
+//   EN_ACTIVE_LEVEL to match *your* carrier (runtime: pin LOW + no motion => try HIGH).
 // - When switching F/R, EN is turned off first, short delay, then F/R updated
 //   (per manual), then EN restored if still commanding motion.
 // ============================================================================
@@ -119,7 +120,7 @@ const unsigned long TELEMETRY_PERIOD_MS = 200;
 
 unsigned long lastOutTelemMillis = 0;
 
-// HIGH here means "enable pin driven high to run" — flip if your driver is inverted.
+// Mega pin level that enables the driver while commanding non-zero speed.
 const bool EN_ACTIVE_LEVEL = HIGH;
 
 // If true, zero speed and stopAllMotors() ground BK (brake on).
@@ -127,6 +128,51 @@ const bool BRAKE_WHEN_STOPPED = true;
 
 // Microseconds: after dropping EN, wait before toggling F/R (driver datasheet).
 const uint16_t FR_EN_OFF_DELAY_US = 5000;
+
+// 1 = NDJSON lines prefixed with AGENT_NDJSON (capture Serial to .cursor/debug-aaa265.log).
+#define AGENT_DEBUG_SERIAL 1
+static uint32_t agentCtlTick = 0;
+#if AGENT_DEBUG_SERIAL
+// #region agent log
+static void agentJsonOpen(const char *hypothesisId, const char *location) {
+  Serial.print(F("AGENT_NDJSON {\"sessionId\":\"aaa265\",\"hypothesisId\":\""));
+  Serial.print(hypothesisId);
+  Serial.print(F("\",\"location\":\""));
+  Serial.print(location);
+  Serial.print(F("\",\"timestamp\":"));
+  Serial.print(millis());
+}
+static void agentJsonClose() { Serial.println('}'); }
+
+static void agentStopReason(const char *reason) {
+  agentJsonOpen("H4", "pre_stopAllMotors");
+  Serial.print(F(",\"reason\":\""));
+  Serial.print(reason);
+  Serial.print('"');
+  agentJsonClose();
+}
+
+static void agentLogPinSnapshot(void) {
+  agentJsonOpen("H5", "pin_snapshot");
+  Serial.print(F(",\"tick\":"));
+  Serial.print(agentCtlTick);
+  Serial.print(F(",\"p\":[["));
+  for (uint8_t i = 0; i < NUM_WHEELS; i++) {
+    if (i) {
+      Serial.print(F("],["));
+    }
+    Serial.print(digitalRead(kPins[i].en));
+    Serial.print(',');
+    Serial.print(digitalRead(kPins[i].frPin));
+    Serial.print(',');
+    Serial.print(digitalRead(kPins[i].bkPin));
+  }
+  Serial.print(F("]],\"EN_ACTIVE_LEVEL\":"));
+  Serial.print(EN_ACTIVE_LEVEL ? 1 : 0);
+  agentJsonClose();
+}
+// #endregion
+#endif
 
 // ---------------------------------------------------------------------------
 // Runtime state
@@ -268,6 +314,11 @@ void printStatusLine() {
 
 // Safe stop: disable drivers, PWM zero, optional brake.
 void stopAllMotors() {
+#if AGENT_DEBUG_SERIAL
+  agentJsonOpen("H6", "stopAllMotors");
+  Serial.print(F(",\"message\":\"enter\""));
+  agentJsonClose();
+#endif
   for (uint8_t i = 0; i < NUM_WHEELS; i++) {
     digitalWrite(kPins[i].en, !EN_ACTIVE_LEVEL);
     analogWrite(kPins[i].svPwm, 0);
@@ -334,6 +385,25 @@ void applyWheelCommand(uint8_t index, int signedCmd) {
 
   lastSvDuty[index] = (uint8_t)magnitude;
   lastEnOn[index] = (magnitude > 0) ? 1 : 0;
+
+#if AGENT_DEBUG_SERIAL
+  if (agentCtlTick <= 4u) {
+    agentJsonOpen("H5", "applyWheelCommand");
+    Serial.print(F(",\"i\":"));
+    Serial.print(index);
+    Serial.print(F(",\"signedCmd\":"));
+    Serial.print(signedCmd);
+    Serial.print(F(",\"mag\":"));
+    Serial.print(magnitude);
+    Serial.print(F(",\"dirFwd\":"));
+    Serial.print(dirForward ? 1 : 0);
+    Serial.print(F(",\"enPinRead\":"));
+    Serial.print(digitalRead(kPins[index].en));
+    Serial.print(F(",\"enActiveLevelCfg\":"));
+    Serial.print(EN_ACTIVE_LEVEL ? 1 : 0);
+    agentJsonClose();
+  }
+#endif
 }
 
 // Body twist (vx, vy, omega) -> each wheel rad/s for this omni layout, then PWM.
@@ -362,6 +432,25 @@ void applyInverseKinematics(float vx, float vy, float omega) {
       wheelCmd[i] = (int)roundf(wheelRadPerSec[i] * scale);
     }
   }
+
+#if AGENT_DEBUG_SERIAL
+  if (agentCtlTick <= 30u || (agentCtlTick % 25u) == 0u) {
+    agentJsonOpen("H3", "ik_wheelCmd");
+    Serial.print(F(",\"tick\":"));
+    Serial.print(agentCtlTick);
+    Serial.print(F(",\"maxAbsE4\":"));
+    Serial.print((long)(maxAbs * 10000.0f));
+    Serial.print(F(",\"w\":["));
+    for (uint8_t i = 0; i < NUM_WHEELS; i++) {
+      if (i) {
+        Serial.print(',');
+      }
+      Serial.print(wheelCmd[i]);
+    }
+    Serial.print(']');
+    agentJsonClose();
+  }
+#endif
 
   for (uint8_t i = 0; i < NUM_WHEELS; i++) {
     applyWheelCommand(i, wheelCmd[i]);
@@ -400,6 +489,8 @@ bool runControlTick() {
   if (now - moveStartMillis > MOVE_TIMEOUT_MS) {
     return false;
   }
+
+  agentCtlTick++;
 
   float dsWheel[NUM_WHEELS];
   const float mpp = metersPerPulse();
@@ -448,6 +539,12 @@ bool runControlTick() {
   const float vy = vCmd * uy;
   applyInverseKinematics(vx, vy, 0.0f);
 
+#if AGENT_DEBUG_SERIAL
+  if (agentCtlTick <= 5u || (agentCtlTick % 25u) == 0u) {
+    agentLogPinSnapshot();
+  }
+#endif
+
   // Require both small position error and small command to avoid stopping early.
   if (fabsf(err) < DIST_TOL_M && fabsf(vCmd) < VEL_EPS_MPS) {
     if (doneStableCycles < 255) doneStableCycles++;
@@ -455,8 +552,40 @@ bool runControlTick() {
     doneStableCycles = 0;
   }
 
+#if AGENT_DEBUG_SERIAL
+  if (agentCtlTick <= 40u || (agentCtlTick % 25u) == 0u) {
+    agentJsonOpen("H3", "pid_tick");
+    Serial.print(F(",\"tick\":"));
+    Serial.print(agentCtlTick);
+    Serial.print(F(",\"err_mm\":"));
+    Serial.print((long)(err * 1000.0f));
+    Serial.print(F(",\"dist_mm\":"));
+    Serial.print((long)(distTraveled * 1000.0f));
+    Serial.print(F(",\"goal_mm\":"));
+    Serial.print((long)(distanceGoal_m * 1000.0f));
+    Serial.print(F(",\"vCmdE4\":"));
+    Serial.print((long)(vCmd * 10000.0f));
+    Serial.print(F(",\"vxE4\":"));
+    Serial.print((long)(vx * 10000.0f));
+    Serial.print(F(",\"vyE4\":"));
+    Serial.print((long)(vy * 10000.0f));
+    Serial.print(F(",\"doneStable\":"));
+    Serial.print(doneStableCycles);
+    Serial.print(F(",\"moveAge_ms\":"));
+    Serial.print(now - moveStartMillis);
+    agentJsonClose();
+  }
+#endif
+
   // Stable at goal: stop, report odometry in inches, acknowledge.
   if (doneStableCycles >= DONE_HOLD_CYCLES) {
+#if AGENT_DEBUG_SERIAL
+    agentJsonOpen("H4", "move_done_stable");
+    Serial.print(F(",\"doneStable\":"));
+    Serial.print(doneStableCycles);
+    agentJsonClose();
+    agentStopReason("done_stable");
+#endif
     stopAllMotors();
     moveState = STATE_IDLE;
     pidIntegral = 0.0f;
@@ -498,6 +627,45 @@ static bool parseCommaPair(const char *line, float *outD, float *outA) {
   return isfinite(*outD) && isfinite(*outA);
 }
 
+// True when cmdBuf[0..len) is a complete distance_in,angle_rad (no trailing junk).
+// Matches Arduino_serial_reader.ino commaLineComplete — tools with no LF/CR still work.
+static bool omniCommaMoveLineComplete(uint8_t len) {
+  if (len == 0 || len >= CMD_BUF_SIZE) {
+    return false;
+  }
+  cmdBuf[len] = '\0';
+  if (strchr(cmdBuf, ',') == NULL) {
+    return false;
+  }
+  char *end1 = NULL;
+  (void)strtod(cmdBuf, &end1);
+  if (end1 == cmdBuf) {
+    return false;
+  }
+  while (*end1 == ' ' || *end1 == '\t') {
+    end1++;
+  }
+  if (*end1 != ',') {
+    return false;
+  }
+  char *p2 = end1 + 1;
+  while (*p2 == ' ' || *p2 == '\t') {
+    p2++;
+  }
+  if (*p2 == '\0') {
+    return false;
+  }
+  char *end2 = NULL;
+  (void)strtod(p2, &end2);
+  if (end2 == p2) {
+    return false;
+  }
+  while (*end2 == ' ' || *end2 == '\t') {
+    end2++;
+  }
+  return *end2 == '\0';
+}
+
 // Called when a full line arrived in IDLE: validate, init mission, start MOVING.
 void tryProcessIdleLine() {
   if (cmdLen == 0) return;
@@ -527,6 +695,12 @@ void tryProcessIdleLine() {
   float dIn = 0.0f;
   float aRad = 0.0f;
   if (!parseCommaPair(cmdBuf, &dIn, &aRad)) {
+#if AGENT_DEBUG_SERIAL
+    agentJsonOpen("H1", "tryProcessIdleLine");
+    Serial.print(F(",\"message\":\"ERR_BAD_LINE\",\"cmdLen\":"));
+    Serial.print(cmdLen);
+    agentJsonClose();
+#endif
     Serial.println(F("ERR BAD_LINE"));
     cmdLen = 0;
     return;
@@ -552,8 +726,24 @@ void tryProcessIdleLine() {
   snapshotPgBaseline();
   moveStartMillis = millis();
   moveState = STATE_MOVING;
+  agentCtlTick = 0;
   // Run first control tick on the next loop iteration without waiting a full period.
   lastControlMillis = moveStartMillis - CONTROL_PERIOD_MS;
+
+#if AGENT_DEBUG_SERIAL
+  agentJsonOpen("H1", "ACK_MOVE");
+  Serial.print(F(",\"dIn_mm\":"));
+  Serial.print((long)(dIn * 1000.0f));
+  Serial.print(F(",\"aRadE4\":"));
+  Serial.print((long)(aRad * 10000.0f));
+  Serial.print(F(",\"goal_mm\":"));
+  Serial.print((long)(distanceGoal_m * 1000.0f));
+  Serial.print(F(",\"uxE4\":"));
+  Serial.print((long)(ux * 10000.0f));
+  Serial.print(F(",\"uyE4\":"));
+  Serial.print((long)(uy * 10000.0f));
+  agentJsonClose();
+#endif
 
   Serial.println(F("ACK MOVE"));
   updateStatusOutputs();
@@ -589,13 +779,46 @@ void setup() {
   digitalWrite(STATUS_PIN_ARMED, LOW);
   digitalWrite(STATUS_PIN_DRIVE, LOW);
 
+#if AGENT_DEBUG_SERIAL
+  agentJsonOpen("H1", "setup_pre_stopAllMotors");
+  Serial.print(F(",\"EN_ACTIVE_LEVEL\":"));
+  Serial.print(EN_ACTIVE_LEVEL ? 1 : 0);
+  Serial.print(F(",\"BRAKE_WHEN_STOPPED\":"));
+  Serial.print(BRAKE_WHEN_STOPPED ? 1 : 0);
+  agentJsonClose();
+  agentStopReason("setup");
+#endif
   stopAllMotors();
+
+#if AGENT_DEBUG_SERIAL
+  agentJsonOpen("H2", "setup_complete");
+  Serial.print(F(",\"moveState_IDLE\":"));
+  Serial.print(moveState == STATE_IDLE ? 1 : 0);
+  agentJsonClose();
+#endif
 
   Serial.println(F("Omni BLDC: distance_in,angle_rad | PING | STATUS | STOP"));
   Serial.println(F("Telemetry: PG + OUT every 2s; STATUS on demand"));
+  Serial.println(
+      F("Serial: 115200. Prefer line ending Newline; move also accepted without LF after 2nd number."));
 }
 
 void loop() {
+#if AGENT_DEBUG_SERIAL
+  static bool agentSeenMoving = false;
+  if (moveState == STATE_MOVING) {
+    if (!agentSeenMoving) {
+      agentSeenMoving = true;
+      agentJsonOpen("H2", "loop_enter_MOVING");
+      Serial.print(F(",\"lastCtlDelta_ms\":"));
+      Serial.print(millis() - lastControlMillis);
+      agentJsonClose();
+    }
+  } else {
+    agentSeenMoving = false;
+  }
+#endif
+
   // Drain UART: in MOVING, only STOP is honored; other lines discarded.
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
@@ -604,12 +827,17 @@ void loop() {
         if (cmdLen > 0) {
           cmdBuf[cmdLen] = '\0';
           if (strcmp(cmdBuf, "STOP") == 0) {
+#if AGENT_DEBUG_SERIAL
+            agentStopReason("user_stop_moving");
+#endif
             stopAllMotors();
             moveState = STATE_IDLE;
             pidIntegral = 0.0f;
             pidLastErr = 0.0f;
             pidLastUs = 0;
             Serial.println(F("ACK STOP"));
+          } else {
+            Serial.println(F("ERR USE_STOP_THEN_RETRY"));
           }
           cmdLen = 0;
         }
@@ -624,6 +852,10 @@ void loop() {
       tryProcessIdleLine();
     } else if (cmdLen < CMD_BUF_SIZE - 1) {
       cmdBuf[cmdLen++] = c;
+      if (memchr(cmdBuf, ',', cmdLen) != NULL &&
+          omniCommaMoveLineComplete(cmdLen)) {
+        tryProcessIdleLine();
+      }
     } else {
       cmdLen = 0;
       Serial.println(F("ERR CMD_OVERFLOW"));
@@ -636,6 +868,13 @@ void loop() {
   if (moveState == STATE_MOVING && (now - lastControlMillis >= CONTROL_PERIOD_MS)) {
     lastControlMillis = now;
     if (!runControlTick()) {
+#if AGENT_DEBUG_SERIAL
+      agentJsonOpen("H2", "runControlTick_timeout");
+      Serial.print(F(",\"moveAge_ms\":"));
+      Serial.print(now - moveStartMillis);
+      agentJsonClose();
+      agentStopReason("timeout");
+#endif
       stopAllMotors();
       moveState = STATE_IDLE;
       pidIntegral = 0.0f;
