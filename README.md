@@ -29,3 +29,16 @@ source /opt/ros/jazzy/setup.bash
 in ~/ros2_jazzy/
 
 source install/setup.bash
+
+
+Serial Write 
+
+Pi -> Arduino 
+check Arduino is connected to Pi serial port 
+ 
+sudo dmesg | grep tty 
+ls /dev/ttyACM* 
+
+to write across serial port 
+On Pi in arduino_serial_com pkg 
+python3 serial_fast.py 
