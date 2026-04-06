@@ -8,5 +8,5 @@ serial_port = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
 
 while(True):
     msg=input()
-    serial_port.write(msg.encode('utf-8'))
+    serial_port.write((msg + '\n').encode('utf-8'))
     print(f'Sent to Arduino: "{msg}"')
