@@ -126,6 +126,12 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Read lines: distance_m heading_rad (two floats per line) and send each",
     )
+    p.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="Prompt for distance_m and heading_rad (use if running without a TTY, e.g. some IDEs)",
+    )
 
     g = p.add_mutually_exclusive_group()
     g.add_argument("--distance", type=float, default=None, help="Distance (m) over DT_S → speed")
@@ -143,7 +149,11 @@ def _send_pwms(args: argparse.Namespace, pwms: List[int]) -> None:
     if args.dry_run:
         print(line, end="")
         return
-    ser = open_serial(args.port, args.baud)
+    try:
+        ser = open_serial(args.port, args.baud)
+    except (OSError, serial.SerialException) as e:
+        print(f"Serial open failed ({args.port}): {e}", file=sys.stderr)
+        raise SystemExit(1) from e
     try:
         send_line(ser, line)
     finally:
@@ -151,11 +161,71 @@ def _send_pwms(args: argparse.Namespace, pwms: List[int]) -> None:
     print(f'Sent to Arduino: "{line.strip()}"')
 
 
+def _interactive_loop(args: argparse.Namespace) -> int:
+    """Prompt for distance_m and heading_rad until EOF or quit; reuse one serial port."""
+    print(
+        "Interactive mode: enter two numbers per line: distance_m heading_rad",
+        file=sys.stderr,
+    )
+    print(
+        "  (speed = distance_m / 1 s; heading_rad: 0 = +x forward, +π/2 = +y)",
+        file=sys.stderr,
+    )
+    print("  Empty line or 'q' to exit.", file=sys.stderr)
+    ser = None
+    if not args.dry_run:
+        try:
+            ser = open_serial(args.port, args.baud)
+        except (OSError, serial.SerialException) as e:
+            print(f"Serial open failed ({args.port}): {e}", file=sys.stderr)
+            return 1
+    try:
+        while True:
+            try:
+                raw = input("distance_m heading_rad> ").strip()
+            except EOFError:
+                break
+            if not raw or raw.lower() in ("q", "quit", "exit"):
+                break
+            parts = raw.split()
+            if len(parts) < 2:
+                print("Need two numbers: distance_m heading_rad", file=sys.stderr)
+                continue
+            try:
+                dist_m = float(parts[0])
+                heading_rad = float(parts[1])
+            except ValueError:
+                print("Invalid number(s)", file=sys.stderr)
+                continue
+            pwms = pwm_from_distance_heading(
+                dist_m,
+                heading_rad,
+                alpha_rad=args.alpha,
+                pwm_ref_m_s=args.pwm_ref,
+            )
+            out = format_line(pwms)
+            if args.dry_run:
+                print(out, end="")
+            elif ser is not None:
+                send_line(ser, out)
+                print(f'Sent to Arduino: "{out.strip()}"')
+    finally:
+        if ser is not None:
+            ser.close()
+    return 0
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     args = _parse_args(argv)
 
     if args.stdin:
-        ser = None if args.dry_run else open_serial(args.port, args.baud)
+        ser = None
+        if not args.dry_run:
+            try:
+                ser = open_serial(args.port, args.baud)
+            except (OSError, serial.SerialException) as e:
+                print(f"Serial open failed ({args.port}): {e}", file=sys.stderr)
+                return 1
         try:
             for raw in sys.stdin:
                 line_in = raw.strip()
@@ -208,8 +278,27 @@ def main(argv: Iterable[str] | None = None) -> int:
             alpha_rad=args.alpha,
             pwm_ref_m_s=args.pwm_ref,
         )
+    elif args.vy is not None:
+        print("--vy requires --vx", file=sys.stderr)
+        return 2
+    elif (args.heading is not None or args.heading_deg is not None) and args.distance is None:
+        print("--heading / --heading-deg require --distance (or use interactive / -i)", file=sys.stderr)
+        return 2
+    elif args.interactive or (
+        sys.stdin.isatty()
+        and args.distance is None
+        and args.vx is None
+        and args.heading is None
+        and args.heading_deg is None
+        and args.vy is None
+    ):
+        return _interactive_loop(args)
     else:
-        print("Provide --distance and heading, or --vx and --vy, or --stdin", file=sys.stderr)
+        print(
+            "Provide --distance and heading, or --vx and --vy, or --stdin, or run in a terminal "
+            "(interactive), or pass -i/--interactive",
+            file=sys.stderr,
+        )
         return 2
 
     _send_pwms(args, pwms)
