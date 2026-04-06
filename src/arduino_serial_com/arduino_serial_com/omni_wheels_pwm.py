@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import time
 from typing import Iterable, List, Sequence, Tuple
 
 import serial
@@ -35,6 +36,9 @@ MOTOR_PERM: Tuple[int, int, int, int] = (0, 1, 2, 3)
 
 # Offsets for the four rows (radians) relative to ALPHA_RAD
 _WHEEL_ANGLE_OFFSETS = (0.0, math.pi / 2, -math.pi, -math.pi / 2)
+
+# After each non-zero drive command, wait then send 0,0,0,0 (CLI default; override with --stop-after)
+STOP_AFTER_COMMAND_S = 1.0
 
 
 def speed_from_distance(distance_m: float, dt_s: float = DT_S) -> float:
@@ -85,6 +89,39 @@ def open_serial(port: str, baud: int = 115200, timeout: float = 1.0) -> serial.S
 
 def send_line(ser: serial.Serial, line: str) -> None:
     ser.write(line.encode("utf-8"))
+
+
+def send_motor_stop(ser: serial.Serial) -> None:
+    """Tell the Arduino to zero all channels (firmware holds last command until a new line)."""
+    try:
+        send_line(ser, format_line([0, 0, 0, 0]))
+        ser.flush()
+    except (OSError, serial.SerialException):
+        pass
+
+
+def _sleep_then_motor_stop(ser: serial.Serial, seconds: float) -> None:
+    """Wait, then send stop. If interrupted during sleep, stop immediately and re-raise."""
+    if seconds <= 0:
+        return
+    try:
+        time.sleep(seconds)
+    except KeyboardInterrupt:
+        send_motor_stop(ser)
+        raise
+    send_motor_stop(ser)
+
+
+def _send_drive_line_delayed_stop(
+    ser: serial.Serial,
+    line: str,
+    pwms: Sequence[int],
+    stop_after_s: float,
+) -> None:
+    send_line(ser, line)
+    ser.flush()
+    if stop_after_s > 0 and any(pwms):
+        _sleep_then_motor_stop(ser, stop_after_s)
 
 
 def pwm_from_body_velocity(
@@ -140,6 +177,16 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
     p.add_argument("--heading", type=float, default=None, help="Heading (radians), with --distance")
     p.add_argument("--heading-deg", type=float, default=None, help="Heading (degrees), with --distance")
     p.add_argument("--vy", type=float, default=None, help="Body ý (m/s); use with --vx")
+    p.add_argument(
+        "--stop-after",
+        type=float,
+        default=STOP_AFTER_COMMAND_S,
+        metavar="SEC",
+        help=(
+            "After each non-zero drive command, wait SEC seconds then send 0,0,0,0; "
+            "0 disables (default: %(default)s)"
+        ),
+    )
 
     return p.parse_args(list(argv) if argv is not None else None)
 
@@ -155,10 +202,12 @@ def _send_pwms(args: argparse.Namespace, pwms: List[int]) -> None:
         print(f"Serial open failed ({args.port}): {e}", file=sys.stderr)
         raise SystemExit(1) from e
     try:
-        send_line(ser, line)
+        _send_drive_line_delayed_stop(ser, line, pwms, args.stop_after)
     finally:
         ser.close()
     print(f'Sent to Arduino: "{line.strip()}"')
+    if args.stop_after > 0 and any(pwms):
+        print(f'Sent stop after {args.stop_after:g}s: "0,0,0,0"', file=sys.stderr)
 
 
 def _interactive_loop(args: argparse.Namespace) -> int:
@@ -171,7 +220,13 @@ def _interactive_loop(args: argparse.Namespace) -> int:
         "  (speed = distance_m / 1 s; heading_rad: 0 = +x forward, +π/2 = +y)",
         file=sys.stderr,
     )
-    print("  Empty line or 'q' to exit.", file=sys.stderr)
+    sa = args.stop_after
+    if sa > 0:
+        print(
+            f"  After each non-zero command: wait {sa:g}s, then send 0,0,0,0 (--stop-after 0 to disable).",
+            file=sys.stderr,
+        )
+    print("  Empty line or 'q' to exit (motors zeroed on exit). Ctrl+C also stops.", file=sys.stderr)
     ser = None
     if not args.dry_run:
         try:
@@ -184,6 +239,9 @@ def _interactive_loop(args: argparse.Namespace) -> int:
             try:
                 raw = input("distance_m heading_rad> ").strip()
             except EOFError:
+                break
+            except KeyboardInterrupt:
+                print("\nStopping motors…", file=sys.stderr)
                 break
             if not raw or raw.lower() in ("q", "quit", "exit"):
                 break
@@ -207,10 +265,17 @@ def _interactive_loop(args: argparse.Namespace) -> int:
             if args.dry_run:
                 print(out, end="")
             elif ser is not None:
-                send_line(ser, out)
+                try:
+                    _send_drive_line_delayed_stop(ser, out, pwms, args.stop_after)
+                except KeyboardInterrupt:
+                    print("\nStopping motors…", file=sys.stderr)
+                    break
                 print(f'Sent to Arduino: "{out.strip()}"')
+                if args.stop_after > 0 and any(pwms):
+                    print(f'Sent stop after {args.stop_after:g}s: "0,0,0,0"', file=sys.stderr)
     finally:
         if ser is not None:
+            send_motor_stop(ser)
             ser.close()
     return 0
 
@@ -247,10 +312,15 @@ def main(argv: Iterable[str] | None = None) -> int:
                 if args.dry_run:
                     print(out, end="")
                 elif ser is not None:
-                    send_line(ser, out)
+                    _send_drive_line_delayed_stop(ser, out, pwms, args.stop_after)
                     print(f'Sent to Arduino: "{out.strip()}"')
+                    if args.stop_after > 0 and any(pwms):
+                        print(f'Sent stop after {args.stop_after:g}s: "0,0,0,0"', file=sys.stderr)
+        except KeyboardInterrupt:
+            print("\nStopping motors…", file=sys.stderr)
         finally:
             if ser is not None:
+                send_motor_stop(ser)
                 ser.close()
         return 0
 
