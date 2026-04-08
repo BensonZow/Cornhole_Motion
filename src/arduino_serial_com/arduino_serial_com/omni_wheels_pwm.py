@@ -21,12 +21,13 @@ import serial
 DT_S = 1.0
 
 # --- Geometry placeholders (ω = 0: L / half-axle does not affect v_i) ---
-ALPHA_RAD = 0.0  # first wheel angle vs robot +x (radians)
-WHEEL_RADIUS_M = 0.05  # placeholder; v = r·ω if you relate to motor shaft later
-HALF_AXLE_LENGTH_M = 0.15  # placeholder for future yaw term
-
+ALPHA_RAD = 0.785  # first wheel angle vs robot +x (radians)
+WHEEL_RADIUS_M = 0.0485  # placeholder; v = r·ω if you relate to motor shaft later
+HALF_AXLE_LENGTH_M = 0.478  # placeholder for future yaw term
+# max speed is 350 rpm
+#min speed is theoretically 15 rpm, at some random pwm value we dont know yet.
 # Wheel tangential speed (m/s) that maps to |PWM| = 255
-PWM_REF_WHEEL_M_S = 1.0
+PWM_REF_WHEEL_M_S = 1.778
 
 PWM_MAX = 255
 PWM_MIN = -255
