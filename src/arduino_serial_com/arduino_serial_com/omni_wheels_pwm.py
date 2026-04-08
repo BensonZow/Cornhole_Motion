@@ -13,12 +13,14 @@ import argparse
 import math
 import sys
 import time
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, NamedTuple, Sequence, Tuple
 
 import serial
 
 # --- Time horizon for distance → speed (plan: always 1 s) ---
 DT_S = 1.0
+# Decimal fraction of axial max body speed (0..1); CLI --speed-fraction overrides.
+SPEED_LIMIT_FRACTION = 1.0
 
 # --- Geometry placeholders (ω = 0: L / half-axle does not affect v_i) ---
 ALPHA_RAD = 0.785  # first wheel angle vs robot +x (radians)
@@ -40,6 +42,75 @@ _WHEEL_ANGLE_OFFSETS = (0.0, math.pi / 2, -math.pi, -math.pi / 2)
 
 # After each non-zero drive command, wait then send 0,0,0,0 (CLI default; override with --stop-after)
 STOP_AFTER_COMMAND_S = 1.0
+
+
+class SpeedLimitDerived(NamedTuple):
+    v_axial_max_m_s: float
+    v_body_cap_m_s: float
+    v_wheel_peak_m_s: float
+    max_distance_allowed_m: float
+
+
+def max_wheel_gain_for_heading(heading_rad: float, alpha_rad: float = ALPHA_RAD) -> float:
+    """max_i |sin(heading - α_i)| for unit-speed body motion along heading_rad."""
+    k = 0.0
+    for off in _WHEEL_ANGLE_OFFSETS:
+        a = alpha_rad + off
+        k = max(k, abs(math.sin(heading_rad - a)))
+    return k
+
+
+def max_body_speed_m_s_for_heading(
+    heading_rad: float,
+    *,
+    pwm_ref_m_s: float,
+    alpha_rad: float = ALPHA_RAD,
+) -> float:
+    """Max body speed (m/s) before the fastest wheel hits pwm_ref tangential (|PWM|=255)."""
+    k = max_wheel_gain_for_heading(heading_rad, alpha_rad)
+    if k < 1e-12:
+        return float("inf")
+    return pwm_ref_m_s / k
+
+
+def derive_speed_limit_metrics(
+    *,
+    speed_fraction: float,
+    pwm_ref_m_s: float,
+    alpha_rad: float,
+    dt_s: float = DT_S,
+) -> SpeedLimitDerived:
+    """Axial (+x) reference: v_axial_max, then fraction-scaled caps and max |distance_m| over dt_s."""
+    v_axial_max = max_body_speed_m_s_for_heading(0.0, pwm_ref_m_s=pwm_ref_m_s, alpha_rad=alpha_rad)
+    v_body_cap = speed_fraction * v_axial_max
+    v_wheel_peak = speed_fraction * pwm_ref_m_s
+    max_dist = v_body_cap * dt_s
+    return SpeedLimitDerived(v_axial_max, v_body_cap, v_wheel_peak, max_dist)
+
+
+def _print_speed_limit_banner(
+    m: SpeedLimitDerived,
+    speed_fraction: float,
+    dt_s: float,
+    *,
+    file=sys.stderr,
+) -> None:
+    pct = speed_fraction * 100.0
+    print(
+        f"  Speed limit: {pct:g}% of axial max body speed "
+        f"(v_axial_max ≈ {m.v_axial_max_m_s:g} m/s, +x ref)",
+        file=file,
+    )
+    print(
+        f"  Allowed body speed cap ≈ {m.v_body_cap_m_s:g} m/s; "
+        f"peak wheel tangential at axial cap ≈ {m.v_wheel_peak_m_s:g} m/s",
+        file=file,
+    )
+    print(
+        f"  Max |distance_m| over {dt_s:g} s: {m.max_distance_allowed_m:g} m "
+        "(larger inputs are rejected, no motion sent)",
+        file=file,
+    )
 
 
 def speed_from_distance(distance_m: float, dt_s: float = DT_S) -> float:
@@ -152,6 +223,13 @@ def pwm_from_distance_heading(
     return pwm_from_body_velocity(x_dot, y_dot, alpha_rad=alpha_rad, pwm_ref_m_s=pwm_ref_m_s, perm=perm)
 
 
+def _parse_speed_fraction(s: str) -> float:
+    x = float(s)
+    if math.isnan(x) or x < 0.0 or x > 1.0:
+        raise argparse.ArgumentTypeError("expect a decimal in [0, 1], e.g. 0.8 for 80%")
+    return x
+
+
 def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Omni wheel PWM over serial (4 values, -255..255).")
     p.add_argument("--port", default="/dev/ttyACM0", help="Serial device")
@@ -159,6 +237,13 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true", help="Print line only, do not open serial")
     p.add_argument("--pwm-ref", type=float, default=PWM_REF_WHEEL_M_S, help="Wheel m/s for |PWM|=255")
     p.add_argument("--alpha", type=float, default=ALPHA_RAD, help="First wheel angle vs +x (radians)")
+    p.add_argument(
+        "--speed-fraction",
+        type=_parse_speed_fraction,
+        default=SPEED_LIMIT_FRACTION,
+        metavar="F",
+        help="Fraction of axial max body speed (0..1); |distance_m| above cap is rejected (no send)",
+    )
     p.add_argument(
         "--stdin",
         action="store_true",
@@ -213,6 +298,12 @@ def _send_pwms(args: argparse.Namespace, pwms: List[int]) -> None:
 
 def _interactive_loop(args: argparse.Namespace) -> int:
     """Prompt for distance_m and heading_rad until EOF or quit; reuse one serial port."""
+    lim = derive_speed_limit_metrics(
+        speed_fraction=args.speed_fraction,
+        pwm_ref_m_s=args.pwm_ref,
+        alpha_rad=args.alpha,
+        dt_s=DT_S,
+    )
     print(
         "Interactive mode: enter two numbers per line: distance_m heading_rad",
         file=sys.stderr,
@@ -221,6 +312,7 @@ def _interactive_loop(args: argparse.Namespace) -> int:
         "  (speed = distance_m / 1 s; heading_rad: 0 = +x forward, +π/2 = +y)",
         file=sys.stderr,
     )
+    _print_speed_limit_banner(lim, args.speed_fraction, DT_S)
     sa = args.stop_after
     if sa > 0:
         print(
@@ -256,6 +348,13 @@ def _interactive_loop(args: argparse.Namespace) -> int:
             except ValueError:
                 print("Invalid number(s)", file=sys.stderr)
                 continue
+            if abs(dist_m) > lim.max_distance_allowed_m:
+                print(
+                    f"Rejected: |distance_m|={abs(dist_m):g} exceeds max "
+                    f"{lim.max_distance_allowed_m:g} m (no command sent).",
+                    file=sys.stderr,
+                )
+                continue
             pwms = pwm_from_distance_heading(
                 dist_m,
                 heading_rad,
@@ -285,6 +384,15 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = _parse_args(argv)
 
     if args.stdin:
+        lim = derive_speed_limit_metrics(
+            speed_fraction=args.speed_fraction,
+            pwm_ref_m_s=args.pwm_ref,
+            alpha_rad=args.alpha,
+            dt_s=DT_S,
+        )
+        if sys.stderr.isatty():
+            print("stdin mode: each line: distance_m heading_rad", file=sys.stderr)
+            _print_speed_limit_banner(lim, args.speed_fraction, DT_S)
         ser = None
         if not args.dry_run:
             try:
@@ -299,10 +407,21 @@ def main(argv: Iterable[str] | None = None) -> int:
                     continue
                 parts = line_in.split()
                 if len(parts) < 2:
-                    print("stdin: need distance_m heading_rad", file=sys.stderr)
-                    return 2
-                dist_m = float(parts[0])
-                heading_rad = float(parts[1])
+                    print("stdin: skip line (need distance_m heading_rad)", file=sys.stderr)
+                    continue
+                try:
+                    dist_m = float(parts[0])
+                    heading_rad = float(parts[1])
+                except ValueError:
+                    print("stdin: skip line (invalid number(s))", file=sys.stderr)
+                    continue
+                if abs(dist_m) > lim.max_distance_allowed_m:
+                    print(
+                        f"stdin: rejected |distance_m|={abs(dist_m):g} "
+                        f"(max {lim.max_distance_allowed_m:g} m); no command sent",
+                        file=sys.stderr,
+                    )
+                    continue
                 pwms = pwm_from_distance_heading(
                     dist_m,
                     heading_rad,
@@ -333,6 +452,19 @@ def main(argv: Iterable[str] | None = None) -> int:
             print("--distance requires --heading or --heading-deg", file=sys.stderr)
             return 2
         heading_rad = math.radians(args.heading_deg) if args.heading_deg is not None else float(args.heading)
+        lim = derive_speed_limit_metrics(
+            speed_fraction=args.speed_fraction,
+            pwm_ref_m_s=args.pwm_ref,
+            alpha_rad=args.alpha,
+            dt_s=DT_S,
+        )
+        if abs(args.distance) > lim.max_distance_allowed_m:
+            print(
+                f"|distance|={abs(args.distance):g} m exceeds max {lim.max_distance_allowed_m:g} m "
+                "(no command sent).",
+                file=sys.stderr,
+            )
+            return 2
         pwms = pwm_from_distance_heading(
             args.distance,
             heading_rad,
