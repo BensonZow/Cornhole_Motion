@@ -5,9 +5,9 @@ import time
 import sys
 
 # ========== CONFIGURATION ==========
-SERIAL_PORT = '/dev/ttyUSB0'   # Adjust to your serial port (e.g., '/dev/ttyAMA0')
+SERIAL_PORT = '/dev/ttyACM0'   # Adjust to your serial port (e.g., '/dev/ttyAMA0')
 BAUD_RATE = 115200
-MAX_PWM = 100                  # PWM range: -MAX_PWM .. +MAX_PWM
+MAX_PWM = 20                  # PWM range: -MAX_PWM .. +MAX_PWM
 
 # Wheel order: front-left, front-right, rear-left, rear-right
 # Kinematics for pure translation (no rotation) using 4 omni wheels at 45° corners:
