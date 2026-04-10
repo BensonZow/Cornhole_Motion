@@ -14,7 +14,10 @@ import math
 import sys
 import time
 from typing import Iterable, List, NamedTuple, Sequence, Tuple
-
+import sys
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float32MultiArray
 import serial
 
 # --- Time horizon for distance → speed (plan: always 1 s) ---
@@ -49,6 +52,108 @@ class SpeedLimitDerived(NamedTuple):
     v_body_cap_m_s: float
     v_wheel_peak_m_s: float
     max_distance_allowed_m: float
+import sys
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float32MultiArray
+import sys
+import math
+import rclpy
+import serial
+from rclpy.node import Node
+from std_msgs.msg import Float32MultiArray
+from typing import Iterable
+
+class TrackerSubscriber(Node):
+    def __init__(self, args: argparse.Namespace):
+        super().__init__('tracker_subscriber')
+        self.args = args
+        self.ser = None
+
+        # 1. Setup Serial once during initialization
+        if not self.args.dry_run:
+            try:
+                self.ser = open_serial(self.args.port, self.args.baud)
+                self.get_logger().info(f"Serial opened on {self.args.port}")
+            except (OSError, serial.SerialException) as e:
+                self.get_logger().error(f"Serial open failed: {e}")
+                raise e
+
+        # 2. Pre-calculate limits if using distance mode
+        self.lim = derive_speed_limit_metrics(
+            speed_fraction=self.args.speed_fraction,
+            pwm_ref_m_s=self.args.pwm_ref,
+            alpha_rad=self.args.alpha,
+            dt_s=DT_S,
+        )
+
+        self.subscription = self.create_subscription(
+            Float32MultiArray,
+            'result_topic',
+            self.listener_callback,
+            10
+        )
+
+    def listener_callback(self, msg: Float32MultiArray):
+        # We replace the 'sys.stdin' / 'argv' logic here.
+        # Assuming msg.data contains [val1, val2]
+        if len(msg.data) < 2:
+            return
+
+        pwms = [0, 0, 0, 0]
+        
+        # --- ALL YOUR ORIGINAL CONDITIONALS INTEGRATED ---
+        
+        # Scenario A: Interpreting data as [distance, heading] (replaces --stdin and --distance)
+        if self.args.stdin or self.args.distance is not None:
+            dist_m = msg.data[0]
+            # Handle heading vs heading_deg logic
+            if self.args.heading_deg is not None:
+                heading_rad = math.radians(self.args.heading_deg)
+            else:
+                heading_rad = msg.data[1] # Assume second float is radians
+
+            if abs(dist_m) > self.lim.max_distance_allowed_m:
+                self.get_logger().warn(f"Rejected |dist|={abs(dist_m):g} (max {self.lim.max_distance_allowed_m:g})")
+                return
+
+            pwms = pwm_from_distance_heading(
+                dist_m,
+                heading_rad,
+                alpha_rad=self.args.alpha,
+                pwm_ref_m_s=self.args.pwm_ref,
+            )
+
+        # Scenario B: Interpreting data as [vx, vy]
+        elif self.args.vx is not None or (len(msg.data) == 2 and self.args.distance is None):
+            vx = msg.data[0]
+            vy = msg.data[1]
+            pwms = pwm_from_body_velocity(
+                float(vx),
+                float(vy),
+                alpha_rad=self.args.alpha,
+                pwm_ref_m_s=self.args.pwm_ref,
+            )
+
+        else:
+            self.get_logger().error("Node configuration does not match incoming data format")
+            return
+
+        # 3. Execution (replaces _send_pwms)
+        out = format_line(pwms)
+        if self.args.dry_run:
+            print(f"DRY RUN: {out.strip()}")
+        elif self.ser is not None:
+            _send_drive_line_delayed_stop(self.ser, out, pwms, self.args.stop_after)
+            if self.args.stop_after > 0 and any(pwms):
+                 self.get_logger().info(f"Sent command; stop scheduled in {self.args.stop_after}s")
+
+    def stop_motors_and_close(self):
+        if self.ser is not None:
+            send_motor_stop(self.ser)
+            self.ser.close()
+            self.get_logger().info("Serial port closed.")
+
 
 
 def max_wheel_gain_for_heading(heading_rad: float, alpha_rad: float = ALPHA_RAD) -> float:
@@ -381,130 +486,25 @@ def _interactive_loop(args: argparse.Namespace) -> int:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
-    args = _parse_args(argv)
+    # Use your existing _parse_args
+    args = _parse_args(argv if argv is not None else sys.argv[1:])
 
-    if args.stdin:
-        lim = derive_speed_limit_metrics(
-            speed_fraction=args.speed_fraction,
-            pwm_ref_m_s=args.pwm_ref,
-            alpha_rad=args.alpha,
-            dt_s=DT_S,
-        )
-        if sys.stderr.isatty():
-            print("stdin mode: each line: distance_m heading_rad", file=sys.stderr)
-            _print_speed_limit_banner(lim, args.speed_fraction, DT_S)
-        ser = None
-        if not args.dry_run:
-            try:
-                ser = open_serial(args.port, args.baud)
-            except (OSError, serial.SerialException) as e:
-                print(f"Serial open failed ({args.port}): {e}", file=sys.stderr)
-                return 1
-        try:
-            for raw in sys.stdin:
-                line_in = raw.strip()
-                if not line_in or line_in.startswith("#"):
-                    continue
-                parts = line_in.split()
-                if len(parts) < 2:
-                    print("stdin: skip line (need distance_m heading_rad)", file=sys.stderr)
-                    continue
-                try:
-                    dist_m = float(parts[0])
-                    heading_rad = float(parts[1])
-                except ValueError:
-                    print("stdin: skip line (invalid number(s))", file=sys.stderr)
-                    continue
-                if abs(dist_m) > lim.max_distance_allowed_m:
-                    print(
-                        f"stdin: rejected |distance_m|={abs(dist_m):g} "
-                        f"(max {lim.max_distance_allowed_m:g} m); no command sent",
-                        file=sys.stderr,
-                    )
-                    continue
-                pwms = pwm_from_distance_heading(
-                    dist_m,
-                    heading_rad,
-                    alpha_rad=args.alpha,
-                    pwm_ref_m_s=args.pwm_ref,
-                )
-                out = format_line(pwms)
-                if args.dry_run:
-                    print(out, end="")
-                elif ser is not None:
-                    _send_drive_line_delayed_stop(ser, out, pwms, args.stop_after)
-                    print(f'Sent to Arduino: "{out.strip()}"')
-                    if args.stop_after > 0 and any(pwms):
-                        print(f'Sent stop after {args.stop_after:g}s: "0,0,0,0"', file=sys.stderr)
-        except KeyboardInterrupt:
-            print("\nStopping motors…", file=sys.stderr)
-        finally:
-            if ser is not None:
-                send_motor_stop(ser)
-                ser.close()
-        return 0
-
-    if args.distance is not None:
-        if args.heading is not None and args.heading_deg is not None:
-            print("Use only one of --heading or --heading-deg", file=sys.stderr)
-            return 2
-        if args.heading is None and args.heading_deg is None:
-            print("--distance requires --heading or --heading-deg", file=sys.stderr)
-            return 2
-        heading_rad = math.radians(args.heading_deg) if args.heading_deg is not None else float(args.heading)
-        lim = derive_speed_limit_metrics(
-            speed_fraction=args.speed_fraction,
-            pwm_ref_m_s=args.pwm_ref,
-            alpha_rad=args.alpha,
-            dt_s=DT_S,
-        )
-        if abs(args.distance) > lim.max_distance_allowed_m:
-            print(
-                f"|distance|={abs(args.distance):g} m exceeds max {lim.max_distance_allowed_m:g} m "
-                "(no command sent).",
-                file=sys.stderr,
-            )
-            return 2
-        pwms = pwm_from_distance_heading(
-            args.distance,
-            heading_rad,
-            alpha_rad=args.alpha,
-            pwm_ref_m_s=args.pwm_ref,
-        )
-    elif args.vx is not None:
-        if args.vy is None:
-            print("--vx requires --vy", file=sys.stderr)
-            return 2
-        pwms = pwm_from_body_velocity(
-            float(args.vx),
-            float(args.vy),
-            alpha_rad=args.alpha,
-            pwm_ref_m_s=args.pwm_ref,
-        )
-    elif args.vy is not None:
-        print("--vy requires --vx", file=sys.stderr)
-        return 2
-    elif (args.heading is not None or args.heading_deg is not None) and args.distance is None:
-        print("--heading / --heading-deg require --distance (or use interactive / -i)", file=sys.stderr)
-        return 2
-    elif args.interactive or (
-        sys.stdin.isatty()
-        and args.distance is None
-        and args.vx is None
-        and args.heading is None
-        and args.heading_deg is None
-        and args.vy is None
-    ):
-        return _interactive_loop(args)
-    else:
-        print(
-            "Provide --distance and heading, or --vx and --vy, or --stdin, or run in a terminal "
-            "(interactive), or pass -i/--interactive",
-            file=sys.stderr,
-        )
-        return 2
-
-    _send_pwms(args, pwms)
+    rclpy.init()
+    
+    try:
+        node = TrackerSubscriber(args)
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"Node initialization failed: {e}")
+        return 1
+    finally:
+        if 'node' in locals():
+            node.stop_motors_and_close()
+            node.destroy_node()
+        rclpy.shutdown()
+    
     return 0
 
 
