@@ -5,6 +5,13 @@
 build/*
 install/*
 log/*
+
+# Local / vendored ROS 2 sources (not tracked in this repo)
+src/librealsense2/
+src/realsense-ros/
+src/vision_opencv/
+src/ros/pluginlib/
+
 # Ignore all python cache folders
 **/__pycache__/
 # Ignore all compiled python files

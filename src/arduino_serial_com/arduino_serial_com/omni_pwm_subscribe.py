@@ -60,6 +60,8 @@ import sys
 import math
 import rclpy
 import serial
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray
 from typing import Iterable
@@ -69,6 +71,10 @@ class TrackerSubscriber(Node):
         super().__init__('tracker_subscriber')
         self.args = args
         self.ser = None
+        self.stop_timer = None
+        
+        # Use a Reentrant group so the timer and subscriber can run simultaneously
+        self.callback_group = ReentrantCallbackGroup()
 
         # 1. Setup Serial once during initialization
         if not self.args.dry_run:
@@ -89,9 +95,10 @@ class TrackerSubscriber(Node):
 
         self.subscription = self.create_subscription(
             Float32MultiArray,
-            'result_topic',
+            '/bean_bag_trajectory',
             self.listener_callback,
-            10
+            10,
+            callback_group=self.callback_group # Assign to group
         )
 
     def listener_callback(self, msg: Float32MultiArray):
@@ -148,12 +155,39 @@ class TrackerSubscriber(Node):
             if self.args.stop_after > 0 and any(pwms):
                  self.get_logger().info(f"Sent command; stop scheduled in {self.args.stop_after}s")
 
+        # LOGGING: See if commands are actually being sent
+        self.get_logger().debug(f"Sending PWM: {pwms}")
+        self.send_to_serial(format_line(pwms))
+
+        # Reset the stop timer
+        if self.stop_timer:
+            self.stop_timer.cancel()
+        
+        # Create timer in the reentrant group
+        self.stop_timer = self.create_timer(
+            self.args.stop_after, 
+            self.timer_stop_callback,
+            callback_group=self.callback_group
+        )
+
     def stop_motors_and_close(self):
         if self.ser is not None:
             send_motor_stop(self.ser)
             self.ser.close()
             self.get_logger().info("Serial port closed.")
+    def timer_stop_callback(self):
+        self.get_logger().info("!!! TIMER STOP TRIGGERED !!!")
+        self.send_to_serial("0,0,0,0\n")
+        if self.stop_timer:
+            self.stop_timer.cancel()
+            self.stop_timer = None
 
+    def send_to_serial(self, cmd: str):
+        if self.args.dry_run:
+            print(f"DRY RUN: {cmd.strip()}")
+        elif self.ser and self.ser.is_open:
+            self.ser.write(cmd.encode('utf-8'))
+            self.ser.flush() # Ensure it actually leaves the OS buffer
 
 
 def max_wheel_gain_for_heading(heading_rad: float, alpha_rad: float = ALPHA_RAD) -> float:
@@ -264,249 +298,70 @@ def open_serial(port: str, baud: int = 115200, timeout: float = 1.0) -> serial.S
     return serial.Serial(port, baud, timeout=timeout)
 
 
-def send_line(ser: serial.Serial, line: str) -> None:
-    ser.write(line.encode("utf-8"))
+def open_serial(port: str, baud: int) -> serial.Serial:
+    """Opens the serial port for Arduino communication."""
+    ser = serial.Serial(port, baud, timeout=0.1)
+    time.sleep(2)  # Wait for Arduino reset
+    return ser
 
+def format_line(pwms: Iterable[int]) -> str:
+    """Formats PWM list into the string expected by the Arduino firmware."""
+    # Maps internal calculation order to physical MOTOR_PERM order
+    ordered = [pwms[MOTOR_PERM[i]] for i in range(4)]
+    return ",".join(map(str, ordered)) + "\n"
 
-def send_motor_stop(ser: serial.Serial) -> None:
-    """Tell the Arduino to zero all channels (firmware holds last command until a new line)."""
-    try:
-        send_line(ser, format_line([0, 0, 0, 0]))
-        ser.flush()
-    except (OSError, serial.SerialException):
-        pass
+def send_motor_stop(ser: serial.Serial):
+    """Sends zero velocity to all motors."""
+    ser.write(b"0,0,0,0\n")
 
-
-def _sleep_then_motor_stop(ser: serial.Serial, seconds: float) -> None:
-    """Wait, then send stop. If interrupted during sleep, stop immediately and re-raise."""
-    if seconds <= 0:
-        return
-    try:
-        time.sleep(seconds)
-    except KeyboardInterrupt:
+def _send_drive_line_delayed_stop(ser: serial.Serial, line: str, pwms: List[int], delay: float):
+    """Sends the command and handles the stop-after timer."""
+    ser.write(line.encode('utf-8'))
+    if delay > 0 and any(pwms):
+        time.sleep(delay)
         send_motor_stop(ser)
-        raise
-    send_motor_stop(ser)
 
+def pwm_from_body_velocity(vx: float, vy: float, alpha_rad: float, pwm_ref_m_s: float) -> List[int]:
+    """Converts x/y velocity to discrete PWM values [-255, 255]."""
+    v_wheels = wheel_linear_velocities(vx, vy, alpha_rad)
+    return [int((v / pwm_ref_m_s) * PWM_MAX) for v in v_wheels]
 
-def _send_drive_line_delayed_stop(
-    ser: serial.Serial,
-    line: str,
-    pwms: Sequence[int],
-    stop_after_s: float,
-) -> None:
-    send_line(ser, line)
-    ser.flush()
-    if stop_after_s > 0 and any(pwms):
-        _sleep_then_motor_stop(ser, stop_after_s)
+def pwm_from_distance_heading(dist_m: float, heading_rad: float, alpha_rad: float, pwm_ref_m_s: float) -> List[int]:
+    """Converts distance/heading to PWM via a 1s time horizon."""
+    speed = speed_from_distance(dist_m, DT_S)
+    vx, vy = body_velocity_from_speed_heading(speed, heading_rad)
+    return pwm_from_body_velocity(vx, vy, alpha_rad, pwm_ref_m_s)
 
-
-def pwm_from_body_velocity(
-    x_dot_m_s: float,
-    y_dot_m_s: float,
-    *,
-    alpha_rad: float = ALPHA_RAD,
-    pwm_ref_m_s: float = PWM_REF_WHEEL_M_S,
-    perm: Sequence[int] = MOTOR_PERM,
-) -> List[int]:
-    vs = wheel_linear_velocities(x_dot_m_s, y_dot_m_s, alpha_rad)
-    vs_ord = apply_motor_perm(vs, perm)
-    return velocities_to_pwm(vs_ord, pwm_ref_m_s)
-
-
-def pwm_from_distance_heading(
-    distance_m: float,
-    heading_rad: float,
-    *,
-    dt_s: float = DT_S,
-    alpha_rad: float = ALPHA_RAD,
-    pwm_ref_m_s: float = PWM_REF_WHEEL_M_S,
-    perm: Sequence[int] = MOTOR_PERM,
-) -> List[int]:
-    v = speed_from_distance(distance_m, dt_s)
-    x_dot, y_dot = body_velocity_from_speed_heading(v, heading_rad)
-    return pwm_from_body_velocity(x_dot, y_dot, alpha_rad=alpha_rad, pwm_ref_m_s=pwm_ref_m_s, perm=perm)
-
-
-def _parse_speed_fraction(s: str) -> float:
-    x = float(s)
-    if math.isnan(x) or x < 0.0 or x > 1.0:
-        raise argparse.ArgumentTypeError("expect a decimal in [0, 1], e.g. 0.8 for 80%")
-    return x
-
-
-def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Omni wheel PWM over serial (4 values, -255..255).")
-    p.add_argument("--port", default="/dev/ttyACM0", help="Serial device")
-    p.add_argument("--baud", type=int, default=115200)
-    p.add_argument("--dry-run", action="store_true", help="Print line only, do not open serial")
-    p.add_argument("--pwm-ref", type=float, default=PWM_REF_WHEEL_M_S, help="Wheel m/s for |PWM|=255")
-    p.add_argument("--alpha", type=float, default=ALPHA_RAD, help="First wheel angle vs +x (radians)")
-    p.add_argument(
-        "--speed-fraction",
-        type=_parse_speed_fraction,
-        default=SPEED_LIMIT_FRACTION,
-        metavar="F",
-        help="Fraction of axial max body speed (0..1); |distance_m| above cap is rejected (no send)",
-    )
-    p.add_argument(
-        "--stdin",
-        action="store_true",
-        help="Read lines: distance_m heading_rad (two floats per line) and send each",
-    )
-    p.add_argument(
-        "-i",
-        "--interactive",
-        action="store_true",
-        help="Prompt for distance_m and heading_rad (use if running without a TTY, e.g. some IDEs)",
-    )
-
-    g = p.add_mutually_exclusive_group()
-    g.add_argument("--distance", type=float, default=None, help="Distance (m) over DT_S → speed")
-    g.add_argument("--vx", type=float, default=None, help="Body ẋ (m/s); use with --vy")
-
-    p.add_argument("--heading", type=float, default=None, help="Heading (radians), with --distance")
-    p.add_argument("--heading-deg", type=float, default=None, help="Heading (degrees), with --distance")
-    p.add_argument("--vy", type=float, default=None, help="Body ý (m/s); use with --vx")
-    p.add_argument(
-        "--stop-after",
-        type=float,
-        default=STOP_AFTER_COMMAND_S,
-        metavar="SEC",
-        help=(
-            "After each non-zero drive command, wait SEC seconds then send 0,0,0,0; "
-            "0 disables (default: %(default)s)"
-        ),
-    )
-
-    return p.parse_args(list(argv) if argv is not None else None)
-
-
-def _send_pwms(args: argparse.Namespace, pwms: List[int]) -> None:
-    line = format_line(pwms)
-    if args.dry_run:
-        print(line, end="")
-        return
-    try:
-        ser = open_serial(args.port, args.baud)
-    except (OSError, serial.SerialException) as e:
-        print(f"Serial open failed ({args.port}): {e}", file=sys.stderr)
-        raise SystemExit(1) from e
-    try:
-        _send_drive_line_delayed_stop(ser, line, pwms, args.stop_after)
-    finally:
-        ser.close()
-    print(f'Sent to Arduino: "{line.strip()}"')
-    if args.stop_after > 0 and any(pwms):
-        print(f'Sent stop after {args.stop_after:g}s: "0,0,0,0"', file=sys.stderr)
-
-
-def _interactive_loop(args: argparse.Namespace) -> int:
-    """Prompt for distance_m and heading_rad until EOF or quit; reuse one serial port."""
-    lim = derive_speed_limit_metrics(
-        speed_fraction=args.speed_fraction,
-        pwm_ref_m_s=args.pwm_ref,
-        alpha_rad=args.alpha,
-        dt_s=DT_S,
-    )
-    print(
-        "Interactive mode: enter two numbers per line: distance_m heading_rad",
-        file=sys.stderr,
-    )
-    print(
-        "  (speed = distance_m / 1 s; heading_rad: 0 = +x forward, +π/2 = +y)",
-        file=sys.stderr,
-    )
-    _print_speed_limit_banner(lim, args.speed_fraction, DT_S)
-    sa = args.stop_after
-    if sa > 0:
-        print(
-            f"  After each non-zero command: wait {sa:g}s, then send 0,0,0,0 (--stop-after 0 to disable).",
-            file=sys.stderr,
-        )
-    print("  Empty line or 'q' to exit (motors zeroed on exit). Ctrl+C also stops.", file=sys.stderr)
-    ser = None
-    if not args.dry_run:
-        try:
-            ser = open_serial(args.port, args.baud)
-        except (OSError, serial.SerialException) as e:
-            print(f"Serial open failed ({args.port}): {e}", file=sys.stderr)
-            return 1
-    try:
-        while True:
-            try:
-                raw = input("distance_m heading_rad> ").strip()
-            except EOFError:
-                break
-            except KeyboardInterrupt:
-                print("\nStopping motors…", file=sys.stderr)
-                break
-            if not raw or raw.lower() in ("q", "quit", "exit"):
-                break
-            parts = raw.split()
-            if len(parts) < 2:
-                print("Need two numbers: distance_m heading_rad", file=sys.stderr)
-                continue
-            try:
-                dist_m = float(parts[0])
-                heading_rad = float(parts[1])
-            except ValueError:
-                print("Invalid number(s)", file=sys.stderr)
-                continue
-            if abs(dist_m) > lim.max_distance_allowed_m:
-                print(
-                    f"Rejected: |distance_m|={abs(dist_m):g} exceeds max "
-                    f"{lim.max_distance_allowed_m:g} m (no command sent).",
-                    file=sys.stderr,
-                )
-                continue
-            pwms = pwm_from_distance_heading(
-                dist_m,
-                heading_rad,
-                alpha_rad=args.alpha,
-                pwm_ref_m_s=args.pwm_ref,
-            )
-            out = format_line(pwms)
-            if args.dry_run:
-                print(out, end="")
-            elif ser is not None:
-                try:
-                    _send_drive_line_delayed_stop(ser, out, pwms, args.stop_after)
-                except KeyboardInterrupt:
-                    print("\nStopping motors…", file=sys.stderr)
-                    break
-                print(f'Sent to Arduino: "{out.strip()}"')
-                if args.stop_after > 0 and any(pwms):
-                    print(f'Sent stop after {args.stop_after:g}s: "0,0,0,0"', file=sys.stderr)
-    finally:
-        if ser is not None:
-            send_motor_stop(ser)
-            ser.close()
-    return 0
-
-
-def main(argv: Iterable[str] | None = None) -> int:
-    # Use your existing _parse_args
-    args = _parse_args(argv if argv is not None else sys.argv[1:])
-
-    rclpy.init()
+def main(args=None):
+    parser = argparse.ArgumentParser(description="Omni-wheel Serial Node")
+    parser.add_argument("--port", type=str, default="/dev/ttyACM0", help="Serial port")
+    parser.add_argument("--baud", type=int, default=115200, help="Serial baud rate")
+    parser.add_argument("--dry-run", action="store_true", help="Print instead of send")
+    parser.add_argument("--speed-fraction", type=float, default=SPEED_LIMIT_FRACTION)
+    parser.add_argument("--alpha", type=float, default=ALPHA_RAD)
+    parser.add_argument("--pwm-ref", type=float, default=PWM_REF_WHEEL_M_S)
+    parser.add_argument("--stop-after", type=float, default=STOP_AFTER_COMMAND_S)
+    # Logic flags for input interpretation
+    parser.add_argument("--stdin", action="store_true")
+    parser.add_argument("--distance", type=float, help="Explicit distance mode")
+    parser.add_argument("--heading-deg", type=float, help="Heading in degrees override")
+    parser.add_argument("--vx", type=float, help="Explicit vx mode")
     
+    parsed_args, unknown = parser.parse_known_args()
+
+    rclpy.init(args=args)
+    node = TrackerSubscriber(parsed_args)
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    executor.spin()
     try:
-        node = TrackerSubscriber(args)
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        print(f"Node initialization failed: {e}")
-        return 1
+        node.get_logger().info("Shutting down...")
     finally:
-        if 'node' in locals():
-            node.stop_motors_and_close()
-            node.destroy_node()
+        node.stop_motors_and_close()
+        node.destroy_node()
         rclpy.shutdown()
-    
-    return 0
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__ == '__main__':
+    main()

@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'sender_node = arduino_serial_com.serial_sender:main',
             'omni_wheels_pwm = arduino_serial_com.omni_wheels_pwm:main',
+            'omni_pwm_subscribe = arduino_serial_com.omni_pwm_subscribe:main',
         ],
     },
 )
