@@ -72,7 +72,9 @@ class TrackerSubscriber(Node):
         self.args = args
         self.ser = None
         self.stop_timer = None
-        
+        self._comm_seq = 0
+        self._last_comm_mono: float | None = None
+
         # Use a Reentrant group so the timer and subscriber can run simultaneously
         self.callback_group = ReentrantCallbackGroup()
 
@@ -101,11 +103,54 @@ class TrackerSubscriber(Node):
             callback_group=self.callback_group # Assign to group
         )
 
+    def _comm_print(self, phase: str, **kwargs: object) -> None:
+        if not self.args.comm_timing:
+            return
+        self._comm_seq += 1
+        now = time.monotonic()
+        delta_ms = 0.0
+        if self._last_comm_mono is not None:
+            delta_ms = (now - self._last_comm_mono) * 1000.0
+        self._last_comm_mono = now
+        parts = [
+            f"[COMMDBG_PY] seq={self._comm_seq} phase={phase}",
+            f"mono_s={now:.6f}",
+            f"delta_since_prev_ms={delta_ms:.3f}",
+        ]
+        for k, v in kwargs.items():
+            parts.append(f"{k}={v}")
+        print(" ".join(parts), file=sys.stderr, flush=True)
+
+    def _try_read_serial_response(self) -> None:
+        if not self.args.comm_timing or self.ser is None or not self.ser.is_open:
+            return
+        t0 = time.monotonic()
+        deadline = t0 + 0.08
+        buf = bytearray()
+        while time.monotonic() < deadline:
+            n = self.ser.in_waiting
+            if n:
+                buf.extend(self.ser.read(n))
+                if b"\n" in buf or b"\r" in buf:
+                    break
+            time.sleep(0.001)
+        if b"\n" not in buf and b"\r" not in buf:
+            buf.extend(self.ser.readline())
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        text = bytes(buf).decode("utf-8", errors="replace").strip()
+        self._comm_print(
+            "serial_read",
+            ack_wait_ms=f"{elapsed_ms:.3f}",
+            resp=repr(text[:200]),
+        )
+
     def listener_callback(self, msg: Float32MultiArray):
         # We replace the 'sys.stdin' / 'argv' logic here.
         # Assuming msg.data contains [val1, val2]
         if len(msg.data) < 2:
             return
+
+        self._comm_print("callback_enter", msg_len=len(msg.data))
 
         pwms = [0, 0, 0, 0]
         
@@ -122,6 +167,7 @@ class TrackerSubscriber(Node):
 
             if abs(dist_m) > self.lim.max_distance_allowed_m:
                 self.get_logger().warn(f"Rejected |dist|={abs(dist_m):g} (max {self.lim.max_distance_allowed_m:g})")
+                self._comm_print("reject_distance", dist_m=dist_m)
                 return
 
             pwms = pwm_from_distance_heading(
@@ -144,20 +190,31 @@ class TrackerSubscriber(Node):
 
         else:
             self.get_logger().error("Node configuration does not match incoming data format")
+            self._comm_print("reject_bad_config")
             return
+
+        self._comm_print("after_compute", pwms=str(pwms))
 
         # 3. Execution (replaces _send_pwms)
         out = format_line(pwms)
         if self.args.dry_run:
             print(f"DRY RUN: {out.strip()}")
         elif self.ser is not None:
+            self._comm_print("before_serial_drive", nbytes=len(out.encode("utf-8")))
+            t_drive = time.monotonic()
             _send_drive_line_delayed_stop(self.ser, out, pwms, self.args.stop_after)
+            self._comm_print(
+                "after_serial_drive",
+                drive_block_ms=f"{(time.monotonic() - t_drive) * 1000.0:.3f}",
+            )
             if self.args.stop_after > 0 and any(pwms):
                  self.get_logger().info(f"Sent command; stop scheduled in {self.args.stop_after}s")
 
         # LOGGING: See if commands are actually being sent
         self.get_logger().debug(f"Sending PWM: {pwms}")
+        self._comm_print("before_send_to_serial")
         self.send_to_serial(format_line(pwms))
+        self._try_read_serial_response()
 
         # Reset the stop timer
         if self.stop_timer:
@@ -177,6 +234,7 @@ class TrackerSubscriber(Node):
             self.get_logger().info("Serial port closed.")
     def timer_stop_callback(self):
         self.get_logger().info("!!! TIMER STOP TRIGGERED !!!")
+        self._comm_print("timer_stop_callback")
         self.send_to_serial("0,0,0,0\n")
         if self.stop_timer:
             self.stop_timer.cancel()
@@ -186,8 +244,11 @@ class TrackerSubscriber(Node):
         if self.args.dry_run:
             print(f"DRY RUN: {cmd.strip()}")
         elif self.ser and self.ser.is_open:
-            self.ser.write(cmd.encode('utf-8'))
-            self.ser.flush() # Ensure it actually leaves the OS buffer
+            raw = cmd.encode("utf-8")
+            self._comm_print("serial_write", nbytes=len(raw))
+            self.ser.write(raw)
+            self.ser.flush()  # Ensure it actually leaves the OS buffer
+            self._comm_print("serial_flush_done")
 
 
 def max_wheel_gain_for_heading(heading_rad: float, alpha_rad: float = ALPHA_RAD) -> float:
@@ -346,7 +407,12 @@ def main(args=None):
     parser.add_argument("--distance", type=float, help="Explicit distance mode")
     parser.add_argument("--heading-deg", type=float, help="Heading in degrees override")
     parser.add_argument("--vx", type=float, help="Explicit vx mode")
-    
+    parser.add_argument(
+        "--comm-timing",
+        action="store_true",
+        help="Print [COMMDBG_PY] seq=... timing lines to stderr (monotonic seq per node)",
+    )
+
     parsed_args, unknown = parser.parse_known_args()
 
     rclpy.init(args=args)

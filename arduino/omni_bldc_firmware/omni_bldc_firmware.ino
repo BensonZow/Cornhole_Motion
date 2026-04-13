@@ -129,6 +129,48 @@ const bool BRAKE_WHEN_STOPPED = true;
 // Microseconds: after dropping EN, wait before toggling F/R (driver datasheet).
 const uint16_t FR_EN_OFF_DELAY_US = 5000;
 
+// 1 = COMMDBG_A lines: seq, delta_ms, now_ms, event= (monotonic per boot; set 0 to disable).
+#define COMM_TIMING_DEBUG 1
+#if COMM_TIMING_DEBUG
+static uint32_t commDbgSeq = 0;
+static unsigned long commDbgLastMs = 0;
+
+static void commDbg(const char *event) {
+  const unsigned long t = millis();
+  commDbgSeq++;
+  const unsigned long d =
+      (commDbgLastMs == 0UL) ? 0UL : (unsigned long)(t - commDbgLastMs);
+  commDbgLastMs = t;
+  Serial.print(F("COMMDBG_A seq="));
+  Serial.print(commDbgSeq);
+  Serial.print(F(" delta_ms="));
+  Serial.print(d);
+  Serial.print(F(" now_ms="));
+  Serial.print(t);
+  Serial.print(F(" event="));
+  Serial.println(event);
+}
+
+static void commDbgAckDone(unsigned long moveAgeMs) {
+  const unsigned long t = millis();
+  commDbgSeq++;
+  const unsigned long d =
+      (commDbgLastMs == 0UL) ? 0UL : (unsigned long)(t - commDbgLastMs);
+  commDbgLastMs = t;
+  Serial.print(F("COMMDBG_A seq="));
+  Serial.print(commDbgSeq);
+  Serial.print(F(" delta_ms="));
+  Serial.print(d);
+  Serial.print(F(" now_ms="));
+  Serial.print(t);
+  Serial.print(F(" event=ack_done move_age_ms="));
+  Serial.println(moveAgeMs);
+}
+#else
+#define commDbg(x) ((void)0)
+#define commDbgAckDone(x) ((void)0)
+#endif
+
 // 1 = NDJSON lines prefixed with AGENT_NDJSON (capture Serial to .cursor/debug-aaa265.log).
 #define AGENT_DEBUG_SERIAL 1
 static uint32_t agentCtlTick = 0;
@@ -603,6 +645,9 @@ bool runControlTick() {
     Serial.print(wheelTravelM[RR] / INCH_TO_M, 4);
     Serial.print(F(" TOTAL "));
     Serial.println(totalIn, 4);
+#if COMM_TIMING_DEBUG
+    commDbgAckDone(now - moveStartMillis);
+#endif
     Serial.println(F("ACK DONE"));
   }
 
@@ -673,21 +718,25 @@ void tryProcessIdleLine() {
 
   if (strcmp(cmdBuf, "PING") == 0) {
     Serial.println(F("PONG"));
+    commDbg("pong_sent");
     cmdLen = 0;
     return;
   }
   if (strcmp(cmdBuf, "HELP") == 0) {
     Serial.println(F("distance_in,angle_rad | PING | STATUS | STOP"));
+    commDbg("help_sent");
     cmdLen = 0;
     return;
   }
   if (strcmp(cmdBuf, "STATUS") == 0) {
     printStatusLine();
+    commDbg("status_sent");
     cmdLen = 0;
     return;
   }
   if (strcmp(cmdBuf, "STOP") == 0) {
     Serial.println(F("ACK STOP"));
+    commDbg("ack_stop_idle");
     cmdLen = 0;
     return;
   }
@@ -702,6 +751,7 @@ void tryProcessIdleLine() {
     agentJsonClose();
 #endif
     Serial.println(F("ERR BAD_LINE"));
+    commDbg("err_bad_line");
     cmdLen = 0;
     return;
   }
@@ -745,6 +795,7 @@ void tryProcessIdleLine() {
   agentJsonClose();
 #endif
 
+  commDbg("ack_move");
   Serial.println(F("ACK MOVE"));
   updateStatusOutputs();
   cmdLen = 0;
@@ -835,8 +886,10 @@ void loop() {
             pidIntegral = 0.0f;
             pidLastErr = 0.0f;
             pidLastUs = 0;
+            commDbg("ack_stop_moving");
             Serial.println(F("ACK STOP"));
           } else {
+            commDbg("err_use_stop_then_retry");
             Serial.println(F("ERR USE_STOP_THEN_RETRY"));
           }
           cmdLen = 0;
@@ -849,11 +902,13 @@ void loop() {
       continue;
     }
     if (c == '\n' || c == '\r') {
+      commDbg("line_ready_nl");
       tryProcessIdleLine();
     } else if (cmdLen < CMD_BUF_SIZE - 1) {
       cmdBuf[cmdLen++] = c;
       if (memchr(cmdBuf, ',', cmdLen) != NULL &&
           omniCommaMoveLineComplete(cmdLen)) {
+        commDbg("line_ready_early");
         tryProcessIdleLine();
       }
     } else {
@@ -880,6 +935,7 @@ void loop() {
       pidIntegral = 0.0f;
       pidLastErr = 0.0f;
       pidLastUs = 0;
+      commDbg("err_timeout");
       Serial.println(F("ERR TIMEOUT"));
       updateStatusOutputs();
     }
