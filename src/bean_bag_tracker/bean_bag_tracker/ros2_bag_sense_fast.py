@@ -31,11 +31,14 @@ class BeanBagTracker(Node):
         self.declare_parameter('collection_timeout_sec', 2.0)
         self.declare_parameter('reset_delay_sec', 10.0)
         self.declare_parameter('min_publish_interval_sec', 5.0)
+        # Max horizontal miss (m, Euclidean from hole) for publishing / motion; larger → no publish, keyboard still arms.
+        self.declare_parameter('max_publish_distance_m', 0.5)
 
         self.hole_distance = self.get_parameter('hole_distance_inches').value * 0.0254  # convert to meters
         self.max_z = self.get_parameter('max_z_meters').value
         self.collection_timeout = self.get_parameter('collection_timeout_sec').value
         self.min_publish_interval = float(self.get_parameter('min_publish_interval_sec').value)
+        self.max_publish_distance_m = float(self.get_parameter('max_publish_distance_m').value)
 
         self._comm_timing = bool(self.get_parameter('comm_timing').value)
         self._comm_seq = 0
@@ -227,22 +230,26 @@ class BeanBagTracker(Node):
                     self._comm_print('collect_complete_trigger_compute', n=len(self.points))
                     self.cancel_timeout_timer()
                     t_compute = time.monotonic()
-                    published = self.compute_and_publish()
+                    published, arm_keyboard = self.compute_and_publish()
                     self._comm_print(
                         'compute_and_publish_returned',
                         compute_wall_ms=f'{(time.monotonic() - t_compute) * 1000.0:.3f}',
                         published=published,
+                        arm_keyboard=arm_keyboard,
                     )
 
-                    if published:
+                    if arm_keyboard:
                         self.state = 'WAIT'
                         self._comm_print('state_wait_keyboard_arm')
                         self._spawn_stdin_arm_thread()
+                        if not published:
+                            self.get_logger().info(
+                                'Trajectory not published (safety); press Enter for next bag.')
                     else:
                         self.points.clear()
                         self.state = 'IDLE'
                         self.get_logger().info(
-                            'Trajectory not published; reset to IDLE for next detection.')
+                            'Trajectory compute skipped (cooldown); reset to IDLE for next detection.')
 
     def _spawn_stdin_arm_thread(self) -> None:
         """Wait for Enter (TTY stdin), then remaining publish cooldown; arm IDLE via poll timer."""
@@ -322,8 +329,12 @@ class BeanBagTracker(Node):
         cy = int(M['m01'] / M['m00'])
         return (cx, cy)
 
-    def compute_and_publish(self) -> bool:
-        """Fit trajectory to collected points, predict landing, publish result. Returns True if published."""
+    def compute_and_publish(self) -> tuple[bool, bool]:
+        """Fit trajectory, predict landing. Returns (published, arm_keyboard).
+
+        ``published`` is True only if a message was sent. ``arm_keyboard`` is True
+        to enter WAIT + stdin (all finished cycles except compute aborted on cooldown).
+        """
         t_compute0 = time.monotonic()
         self._comm_print('compute_enter', n_points=len(self.points))
         now = time.monotonic()
@@ -335,7 +346,7 @@ class BeanBagTracker(Node):
                 'compute_abort_cooldown',
                 elapsed_since_publish_s=f'{now - self._last_publish_mono:.3f}',
             )
-            return False
+            return (False, False)
         # Sort points by time (just in case)
         self.points.sort(key=lambda p: p[0])
         t0 = self.points[0][0]
@@ -366,40 +377,43 @@ class BeanBagTracker(Node):
         if abs(vz) < 1e-6:
             self.get_logger().warn('vz near zero, cannot predict landing')
             self._comm_print('compute_abort_vz_near_zero', vz=vz)
-            return False
+            return (False, True)
         t_land = (self.hole_distance - z0) / vz
 
-        # Check if t_land is positive and reasonable (e.g., < 5 sec)
-        if t_land < 0 or t_land > 5.0:
-            self.get_logger().warn(f'Predicted landing time {t_land:.2f}s out of range')
-            self._comm_print('compute_abort_t_land_range', t_land=t_land)
-            return False
+        if t_land < 0:
+            self.get_logger().warn(f'Predicted landing time {t_land:.2f}s invalid (negative)')
+            self._comm_print('compute_abort_t_land_negative', t_land_s=t_land)
+            return (False, True)
 
         # Compute landing coordinates
         x_land = vx * t_land + x0
         y_land = a_half * t_land**2 + vy * t_land + y0
 
-        # Offsets from hole (hole at x=0, y=0)
+        # Offsets from hole (hole at x=0, y=0), meters
         dx = x_land
         dy = y_land
+        distance_m = math.hypot(dx, dy)
+        angle = math.atan2(dy, dx)  # radians
 
-        # Convert to inches
-        dx_in = dx / 0.0254
-        dy_in = dy / 0.0254
-        distance = math.hypot(dx_in, dy_in)
-        angle = math.atan2(dy_in, dx_in)   # radians, range -pi to pi
+        if distance_m > self.max_publish_distance_m:
+            self.get_logger().warn(
+                f'Landing miss {distance_m:.3f} m exceeds max {self.max_publish_distance_m:.3f} m; '
+                'not publishing'
+            )
+            self._comm_print(
+                'compute_abort_distance_m',
+                distance_m=distance_m,
+                max_publish_distance_m=self.max_publish_distance_m,
+                angle_rad=angle,
+                t_land_s=t_land,
+            )
+            return (False, True)
 
-        # Publish as Float32MultiArray
         msg = Float32MultiArray()
-        msg.data = [float(distance), float(angle)]
-        dist = str(distance)
-        ang = str(angle)
-
-        
-        send_msg = dist + "," + ang
+        msg.data = [float(distance_m), float(angle)]
         self._comm_print(
             'compute_before_publish',
-            distance_in=distance,
+            distance_m=distance_m,
             angle_rad=angle,
             t_land_s=t_land,
         )
@@ -412,10 +426,11 @@ class BeanBagTracker(Node):
             compute_total_ms=f'{(time.monotonic() - t_compute0) * 1000.0:.3f}',
         )
 
-        self.get_logger().info(f'Published: distance={distance:.2f} in, angle={angle:.3f} rad')
+        self.get_logger().info(
+            f'Published: distance={distance_m:.3f} m, angle={angle:.3f} rad'
+        )
 
-        #serial_port.write(send_msg.encode('utf-8'))
-        return True
+        return (True, True)
 
     def start_timeout_timer(self):
         """Start or restart the timeout timer for collection."""
