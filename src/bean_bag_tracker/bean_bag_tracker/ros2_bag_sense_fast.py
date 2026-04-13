@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import math
 import sys
+import threading
 import time
 
 import cv2
@@ -29,16 +30,21 @@ class BeanBagTracker(Node):
         self.declare_parameter('result_topic', '/bean_bag_trajectory')
         self.declare_parameter('collection_timeout_sec', 2.0)
         self.declare_parameter('reset_delay_sec', 10.0)
+        self.declare_parameter('min_publish_interval_sec', 5.0)
 
         self.hole_distance = self.get_parameter('hole_distance_inches').value * 0.0254  # convert to meters
         self.max_z = self.get_parameter('max_z_meters').value
         self.collection_timeout = self.get_parameter('collection_timeout_sec').value
-        self.reset_delay = self.get_parameter('reset_delay_sec').value
+        self.min_publish_interval = float(self.get_parameter('min_publish_interval_sec').value)
 
         self._comm_timing = bool(self.get_parameter('comm_timing').value)
         self._comm_seq = 0
         self._last_comm_mono: float | None = None
         self._last_skip_log_mono = 0.0
+        self._last_publish_mono = float('-inf')
+        self._state_lock = threading.Lock()
+        self._pending_keyboard_reset = False
+        self._stdin_arm_thread: threading.Thread | None = None
 
         # Camera intrinsics (filled when CameraInfo received)
         self.fx = self.fy = self.cx = self.cy = None
@@ -72,6 +78,10 @@ class BeanBagTracker(Node):
         self.ts = message_filters.ApproximateTimeSynchronizer(
             [self.color_sub, self.depth_sub], 10, 0.1)
         self.ts.registerCallback(self.image_callback)
+
+        # stdin thread sets _pending_keyboard_reset; this timer runs on the executor thread.
+        self._keyboard_poll_timer = self.create_timer(
+            0.05, self._keyboard_poll_callback, callback_group=self.callback_group)
 
         self.get_logger().info('Bean Bag Tracker node started')
         if self._comm_timing:
@@ -155,6 +165,8 @@ class BeanBagTracker(Node):
         t4 = time.monotonic()
 
         if not (0.2 < depth < 4.0):
+            if self.state == 'COLLECTING':
+                self.check_timeout()
             self._comm_print(
                 'image_cb_depth_reject',
                 stamp=stamp,
@@ -178,48 +190,105 @@ class BeanBagTracker(Node):
             depth_m=f'{depth:.4f}',
         )
 
-        # Start collecting
-        if self.state == 'IDLE':
-            self.get_logger().info('Bag detected! Starting 3-frame capture...')
-            self._comm_print('collect_start_idle_to_collecting', u=u, v=v)
-            self.points = [(t, x, y, depth)]
-            self.state = 'COLLECTING'
+        with self._state_lock:
+            # Start collecting (respect min interval since last publish)
+            if self.state == 'IDLE':
+                elapsed = time.monotonic() - self._last_publish_mono
+                if elapsed < self.min_publish_interval:
+                    self._comm_print(
+                        'collect_skipped_cooldown',
+                        elapsed_since_publish_s=f'{elapsed:.3f}',
+                        min_interval_s=self.min_publish_interval,
+                    )
+                    return
+                self.get_logger().info('Bag detected! Starting 3-frame capture...')
+                self._comm_print('collect_start_idle_to_collecting', u=u, v=v)
+                self.points = [(t, x, y, depth)]
+                self.state = 'COLLECTING'
+                self.start_timeout_timer()
 
-        # Add subsequent points
-        elif self.state == 'COLLECTING':
-            self.points.append((t, x, y, depth))
-            self._comm_print(
-                'collect_point_appended',
-                n=len(self.points),
-                u=u,
-                v=v,
-            )
-
-            # 3. TRIGGER: Once we hit 3, calculate and SHUT DOWN processing
-            if len(self.points) >= self.required_points:
-                self.get_logger().info(f'Captured {self.required_points} frames. Calculating trajectory...')
-                self._comm_print('collect_complete_trigger_compute', n=len(self.points))
-                t_compute = time.monotonic()
-                self.compute_and_publish()
+            # Add subsequent points
+            elif self.state == 'COLLECTING':
+                self.points.append((t, x, y, depth))
                 self._comm_print(
-                    'compute_and_publish_returned',
-                    compute_wall_ms=f'{(time.monotonic() - t_compute) * 1000.0:.3f}',
+                    'collect_point_appended',
+                    n=len(self.points),
+                    u=u,
+                    v=v,
                 )
 
-                # Enter WAIT state immediately - image_callback will now exit at line 11
-                self.state = 'WAIT'
+                if len(self.points) < self.required_points:
+                    self.restart_timeout_timer()
 
-                # Start the reset timer to go back to IDLE after 5-10 seconds
-                self.create_timer(self.reset_delay, self.reset_state, callback_group=self.callback_group)
-                self._comm_print('state_wait_timer_scheduled', reset_delay_s=self.reset_delay)
+                # TRIGGER: Once we hit 3, calculate and SHUT DOWN processing
+                if len(self.points) >= self.required_points:
+                    self.get_logger().info(
+                        f'Captured {self.required_points} frames. Calculating trajectory...')
+                    self._comm_print('collect_complete_trigger_compute', n=len(self.points))
+                    self.cancel_timeout_timer()
+                    t_compute = time.monotonic()
+                    published = self.compute_and_publish()
+                    self._comm_print(
+                        'compute_and_publish_returned',
+                        compute_wall_ms=f'{(time.monotonic() - t_compute) * 1000.0:.3f}',
+                        published=published,
+                    )
+
+                    if published:
+                        self.state = 'WAIT'
+                        self._comm_print('state_wait_keyboard_arm')
+                        self._spawn_stdin_arm_thread()
+                    else:
+                        self.points.clear()
+                        self.state = 'IDLE'
+                        self.get_logger().info(
+                            'Trajectory not published; reset to IDLE for next detection.')
+
+    def _spawn_stdin_arm_thread(self) -> None:
+        """Wait for Enter (TTY stdin), then remaining publish cooldown; arm IDLE via poll timer."""
+        min_interval = self.min_publish_interval
+
+        def worker() -> None:
+            try:
+                # Requires a TTY when launched with `ros2 run` in a terminal.
+                sys.stdout.write('Press Enter when ready for the next bag...\n')
+                sys.stdout.flush()
+                input()
+            except EOFError:
+                self.get_logger().warn(
+                    'stdin closed (no TTY); arming next bag after cooldown only.')
+            rem = max(0.0, min_interval - (time.monotonic() - self._last_publish_mono))
+            if rem > 0:
+                time.sleep(rem)
+            with self._state_lock:
+                self._pending_keyboard_reset = True
+
+        self._stdin_arm_thread = threading.Thread(target=worker, daemon=True)
+        self._stdin_arm_thread.start()
+
+    def _keyboard_poll_callback(self) -> None:
+        with self._state_lock:
+            if not self._pending_keyboard_reset:
+                return
+            self._apply_idle_reset()
+        self._comm_print('reset_state_enter')
+        self.get_logger().info('System reset. Ready for next bag.')
+        self._comm_print('reset_state_done')
+
+    def _apply_idle_reset(self) -> None:
+        """Clear wait flag and collection state; caller must hold ``_state_lock``."""
+        self._pending_keyboard_reset = False
+        self.state = 'IDLE'
+        self.points.clear()
 
     def reset_state(self):
         """Re-enable image processing for the next throw."""
         self._comm_print('reset_state_enter')
-        self.state = 'IDLE'
-        self.points = []
+        with self._state_lock:
+            self._apply_idle_reset()
         self.get_logger().info('System reset. Ready for next bag.')
         self._comm_print('reset_state_done')
+
     def find_red_centroid(self, bgr_image):
         """Detect the largest red blob and return its centroid (u, v) or None."""
         hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
@@ -253,10 +322,20 @@ class BeanBagTracker(Node):
         cy = int(M['m01'] / M['m00'])
         return (cx, cy)
 
-    def compute_and_publish(self):
-        """Fit trajectory to collected points, predict landing, publish result."""
+    def compute_and_publish(self) -> bool:
+        """Fit trajectory to collected points, predict landing, publish result. Returns True if published."""
         t_compute0 = time.monotonic()
         self._comm_print('compute_enter', n_points=len(self.points))
+        now = time.monotonic()
+        if now - self._last_publish_mono < self.min_publish_interval:
+            self.get_logger().warn(
+                f'Publish cooldown active ({now - self._last_publish_mono:.2f}s '
+                f'< {self.min_publish_interval}s), skipping publish')
+            self._comm_print(
+                'compute_abort_cooldown',
+                elapsed_since_publish_s=f'{now - self._last_publish_mono:.3f}',
+            )
+            return False
         # Sort points by time (just in case)
         self.points.sort(key=lambda p: p[0])
         t0 = self.points[0][0]
@@ -287,14 +366,14 @@ class BeanBagTracker(Node):
         if abs(vz) < 1e-6:
             self.get_logger().warn('vz near zero, cannot predict landing')
             self._comm_print('compute_abort_vz_near_zero', vz=vz)
-            return
+            return False
         t_land = (self.hole_distance - z0) / vz
 
         # Check if t_land is positive and reasonable (e.g., < 5 sec)
         if t_land < 0 or t_land > 5.0:
             self.get_logger().warn(f'Predicted landing time {t_land:.2f}s out of range')
             self._comm_print('compute_abort_t_land_range', t_land=t_land)
-            return
+            return False
 
         # Compute landing coordinates
         x_land = vx * t_land + x0
@@ -326,6 +405,7 @@ class BeanBagTracker(Node):
         )
         t_pub = time.monotonic()
         self.publisher.publish(msg)
+        self._last_publish_mono = time.monotonic()
         self._comm_print(
             'compute_after_publish',
             publish_ms=f'{(time.monotonic() - t_pub) * 1000.0:.3f}',
@@ -335,12 +415,16 @@ class BeanBagTracker(Node):
         self.get_logger().info(f'Published: distance={distance:.2f} in, angle={angle:.3f} rad')
 
         #serial_port.write(send_msg.encode('utf-8'))
-
+        return True
 
     def start_timeout_timer(self):
         """Start or restart the timeout timer for collection."""
         self.cancel_timeout_timer()
-        self.timeout_timer = self.create_timer(self.collection_timeout, self.collection_timeout_cb)
+        self.timeout_timer = self.create_timer(
+            self.collection_timeout,
+            self.collection_timeout_cb,
+            callback_group=self.callback_group,
+        )
 
     def restart_timeout_timer(self):
         self.cancel_timeout_timer()
@@ -356,8 +440,8 @@ class BeanBagTracker(Node):
         self._comm_print('collection_timeout_cb')
         self.get_logger().info('Collection timeout, resetting to IDLE')
         self.cancel_timeout_timer()
-        self.points.clear()
-        self.state = 'IDLE'
+        with self._state_lock:
+            self._apply_idle_reset()
 
     def check_timeout(self):
         """Check if we are in COLLECTING and too much time passed since last point."""
@@ -371,8 +455,8 @@ class BeanBagTracker(Node):
         if self.reset_timer is not None:
             self.reset_timer.cancel()
             self.reset_timer = None
-        self.state = 'IDLE'
-        self.points.clear()
+        with self._state_lock:
+            self._apply_idle_reset()
         self.get_logger().info('Reset complete, ready for next throw')
         self._comm_print('reset_method_done')
 
