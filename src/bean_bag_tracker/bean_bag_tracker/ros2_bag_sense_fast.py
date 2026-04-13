@@ -15,6 +15,9 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.time import Time
 
+# Horizontal offsets from the fitted trajectory share this length unit; miss magnitude is converted to SI.
+INCH_TO_METERS = 0.0254
+
 
 class BeanBagTracker(Node):
     def __init__(self):
@@ -34,7 +37,7 @@ class BeanBagTracker(Node):
         # Max horizontal miss (m, Euclidean from hole) for publishing / motion; larger → no publish, keyboard still arms.
         self.declare_parameter('max_publish_distance_m', 0.5)
 
-        self.hole_distance = self.get_parameter('hole_distance_inches').value * 0.0254  # convert to meters
+        self.hole_distance = self.get_parameter('hole_distance_inches').value * INCH_TO_METERS
         self.max_z = self.get_parameter('max_z_meters').value
         self.collection_timeout = self.get_parameter('collection_timeout_sec').value
         self.min_publish_interval = float(self.get_parameter('min_publish_interval_sec').value)
@@ -53,8 +56,9 @@ class BeanBagTracker(Node):
         self.fx = self.fy = self.cx = self.cy = None
 
         # State variables
-        self.required_points = 3 
-        self.state = 'IDLE'          # IDLE, COLLECTING, WAIT
+        self.required_points = 3
+        # Begin in WAIT until first Enter (same path as post-trajectory keyboard arm).
+        self.state = 'WAIT'  # IDLE, COLLECTING, WAIT
         self.points = []              # list of (timestamp, x, y, z) in meters
         self.collection_start_time = None
         self.timeout_timer = None
@@ -86,9 +90,12 @@ class BeanBagTracker(Node):
         self._keyboard_poll_timer = self.create_timer(
             0.05, self._keyboard_poll_callback, callback_group=self.callback_group)
 
-        self.get_logger().info('Bean Bag Tracker node started')
+        self.get_logger().info(
+            'Bean Bag Tracker node started; waiting for Enter before bag detection.'
+        )
         if self._comm_timing:
             self._comm_print('node_started', result_topic=self.get_parameter('result_topic').value)
+        self._spawn_stdin_arm_thread(startup=True)
 
     def _comm_print(self, phase: str, **kwargs: object) -> None:
         if not self._comm_timing:
@@ -251,14 +258,19 @@ class BeanBagTracker(Node):
                         self.get_logger().info(
                             'Trajectory compute skipped (cooldown); reset to IDLE for next detection.')
 
-    def _spawn_stdin_arm_thread(self) -> None:
+    def _spawn_stdin_arm_thread(self, startup: bool = False) -> None:
         """Wait for Enter (TTY stdin), then remaining publish cooldown; arm IDLE via poll timer."""
         min_interval = self.min_publish_interval
+        prompt = (
+            'Press Enter when ready to start tracking...\n'
+            if startup
+            else 'Press Enter when ready for the next bag...\n'
+        )
 
         def worker() -> None:
             try:
                 # Requires a TTY when launched with `ros2 run` in a terminal.
-                sys.stdout.write('Press Enter when ready for the next bag...\n')
+                sys.stdout.write(prompt)
                 sys.stdout.flush()
                 input()
             except EOFError:
@@ -389,10 +401,11 @@ class BeanBagTracker(Node):
         x_land = vx * t_land + x0
         y_land = a_half * t_land**2 + vy * t_land + y0
 
-        # Offsets from hole (hole at x=0, y=0), meters
+        # Offsets from hole (hole at x=0, y=0); x/y miss from the fit is in inches here.
         dx = x_land
         dy = y_land
-        distance_m = math.hypot(dx, dy)
+        distance_in = math.hypot(dx, dy)
+        distance_m = distance_in * INCH_TO_METERS
         angle = math.atan2(dy, dx)  # radians
 
         if distance_m > self.max_publish_distance_m:
@@ -402,6 +415,7 @@ class BeanBagTracker(Node):
             )
             self._comm_print(
                 'compute_abort_distance_m',
+                distance_in=distance_in,
                 distance_m=distance_m,
                 max_publish_distance_m=self.max_publish_distance_m,
                 angle_rad=angle,
@@ -413,6 +427,7 @@ class BeanBagTracker(Node):
         msg.data = [float(distance_m), float(angle)]
         self._comm_print(
             'compute_before_publish',
+            distance_in=distance_in,
             distance_m=distance_m,
             angle_rad=angle,
             t_land_s=t_land,
