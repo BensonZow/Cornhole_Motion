@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
-import rclpy
-from rclpy.node import Node
-from rclpy.time import Time
+import math
+import sys
+import time
+
 import cv2
 import numpy as np
-import math
-import serial
+import rclpy
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Float32MultiArray
 import message_filters
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.time import Time
+
 
 class BeanBagTracker(Node):
     def __init__(self):
         super().__init__('bean_bag_tracker')
 
         # Parameters (adjustable via ROS params)
+        self.declare_parameter('comm_timing', False)
         self.declare_parameter('hole_distance_inches', 10.0)
         self.declare_parameter('max_z_meters', 3.0)
         self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
@@ -31,6 +34,11 @@ class BeanBagTracker(Node):
         self.max_z = self.get_parameter('max_z_meters').value
         self.collection_timeout = self.get_parameter('collection_timeout_sec').value
         self.reset_delay = self.get_parameter('reset_delay_sec').value
+
+        self._comm_timing = bool(self.get_parameter('comm_timing').value)
+        self._comm_seq = 0
+        self._last_comm_mono: float | None = None
+        self._last_skip_log_mono = 0.0
 
         # Camera intrinsics (filled when CameraInfo received)
         self.fx = self.fy = self.cx = self.cy = None
@@ -66,66 +74,152 @@ class BeanBagTracker(Node):
         self.ts.registerCallback(self.image_callback)
 
         self.get_logger().info('Bean Bag Tracker node started')
+        if self._comm_timing:
+            self._comm_print('node_started', result_topic=self.get_parameter('result_topic').value)
+
+    def _comm_print(self, phase: str, **kwargs: object) -> None:
+        if not self._comm_timing:
+            return
+        self._comm_seq += 1
+        now = time.monotonic()
+        delta_ms = 0.0
+        if self._last_comm_mono is not None:
+            delta_ms = (now - self._last_comm_mono) * 1000.0
+        self._last_comm_mono = now
+        parts = [
+            f'[COMMDBG_BAG] seq={self._comm_seq} phase={phase}',
+            f'mono_s={now:.6f}',
+            f'delta_since_prev_ms={delta_ms:.3f}',
+        ]
+        for k, v in kwargs.items():
+            parts.append(f'{k}={v}')
+        print(' '.join(parts), file=sys.stderr, flush=True)
 
     def camera_info_callback(self, msg):
         """Extract camera intrinsics once."""
         if self.fx is None:
+            t0 = time.monotonic()
             self.fx = msg.k[0]
             self.fy = msg.k[4]
             self.cx = msg.k[2]
             self.cy = msg.k[5]
             self.get_logger().info('Camera intrinsics received')
+            self._comm_print(
+                'camera_intrinsics_set',
+                parse_ms=f'{(time.monotonic() - t0) * 1000.0:.3f}',
+                fx=self.fx,
+                fy=self.fy,
+            )
 
     def image_callback(self, color_msg, depth_msg):
         """Process only the first 3 frames, then stop."""
+        stamp = f'{color_msg.header.stamp.sec}.{color_msg.header.stamp.nanosec:09d}'
         # IF we are in WAIT state, we do zero work (saves CPU)
         if self.state == 'WAIT' or self.fx is None:
+            if self._comm_timing:
+                now = time.monotonic()
+                if now - self._last_skip_log_mono >= 2.0:
+                    self._last_skip_log_mono = now
+                    self._comm_print(
+                        'image_cb_skip_throttled',
+                        stamp=stamp,
+                        reason='wait' if self.state == 'WAIT' else 'no_intrinsics',
+                    )
             return
 
+        t_frame0 = time.monotonic()
         # 1. Convert images only if we are actually looking for a bag
+        t0 = time.monotonic()
         color_image = self.bridge.imgmsg_to_cv2(color_msg, 'bgr8')
+        t1 = time.monotonic()
         centroid = self.find_red_centroid(color_image)
+        t2 = time.monotonic()
 
         if centroid is None:
             if self.state == 'COLLECTING':
                 self.check_timeout()
+            self._comm_print(
+                'image_cb_no_centroid',
+                stamp=stamp,
+                state=self.state,
+                color_cv_ms=f'{(t1 - t0) * 1000.0:.3f}',
+                red_detect_ms=f'{(t2 - t1) * 1000.0:.3f}',
+            )
             return
 
         # 2. Extract 3D data
         u, v = centroid
+        t3 = time.monotonic()
         depth_image = self.bridge.imgmsg_to_cv2(depth_msg, '16UC1')
         depth = depth_image[v, u] / 1000.0
+        t4 = time.monotonic()
 
-        if 0.2 < depth < 4.0:
-            x = (u - self.cx) * depth / self.fx
-            y = (v - self.cy) * depth / self.fy
-            t = Time.from_msg(color_msg.header.stamp).nanoseconds / 1e9
+        if not (0.2 < depth < 4.0):
+            self._comm_print(
+                'image_cb_depth_reject',
+                stamp=stamp,
+                depth_m=depth,
+                depth_cv_ms=f'{(t4 - t3) * 1000.0:.3f}',
+            )
+            return
 
-            # Start collecting
-            if self.state == 'IDLE':
-                self.get_logger().info('Bag detected! Starting 3-frame capture...')
-                self.points = [(t, x, y, depth)]
-                self.state = 'COLLECTING'
-            
-            # Add subsequent points
-            elif self.state == 'COLLECTING':
-                self.points.append((t, x, y, depth))
-                
-                # 3. TRIGGER: Once we hit 3, calculate and SHUT DOWN processing
-                if len(self.points) >= self.required_points:
-                    self.get_logger().info(f'Captured {self.required_points} frames. Calculating trajectory...')
-                    self.compute_and_publish()
-                    
-                    # Enter WAIT state immediately - image_callback will now exit at line 11
-                    self.state = 'WAIT' 
-                    
-                    # Start the reset timer to go back to IDLE after 5-10 seconds
-                    self.create_timer(self.reset_delay, self.reset_state, callback_group=self.callback_group)
+        x = (u - self.cx) * depth / self.fx
+        y = (v - self.cy) * depth / self.fy
+        t = Time.from_msg(color_msg.header.stamp).nanoseconds / 1e9
+
+        self._comm_print(
+            'image_cb_frame_timing',
+            stamp=stamp,
+            state_before=self.state,
+            color_cv_ms=f'{(t1 - t0) * 1000.0:.3f}',
+            red_detect_ms=f'{(t2 - t1) * 1000.0:.3f}',
+            depth_cv_sample_ms=f'{(t4 - t3) * 1000.0:.3f}',
+            frame_total_ms=f'{(t4 - t_frame0) * 1000.0:.3f}',
+            depth_m=f'{depth:.4f}',
+        )
+
+        # Start collecting
+        if self.state == 'IDLE':
+            self.get_logger().info('Bag detected! Starting 3-frame capture...')
+            self._comm_print('collect_start_idle_to_collecting', u=u, v=v)
+            self.points = [(t, x, y, depth)]
+            self.state = 'COLLECTING'
+
+        # Add subsequent points
+        elif self.state == 'COLLECTING':
+            self.points.append((t, x, y, depth))
+            self._comm_print(
+                'collect_point_appended',
+                n=len(self.points),
+                u=u,
+                v=v,
+            )
+
+            # 3. TRIGGER: Once we hit 3, calculate and SHUT DOWN processing
+            if len(self.points) >= self.required_points:
+                self.get_logger().info(f'Captured {self.required_points} frames. Calculating trajectory...')
+                self._comm_print('collect_complete_trigger_compute', n=len(self.points))
+                t_compute = time.monotonic()
+                self.compute_and_publish()
+                self._comm_print(
+                    'compute_and_publish_returned',
+                    compute_wall_ms=f'{(time.monotonic() - t_compute) * 1000.0:.3f}',
+                )
+
+                # Enter WAIT state immediately - image_callback will now exit at line 11
+                self.state = 'WAIT'
+
+                # Start the reset timer to go back to IDLE after 5-10 seconds
+                self.create_timer(self.reset_delay, self.reset_state, callback_group=self.callback_group)
+                self._comm_print('state_wait_timer_scheduled', reset_delay_s=self.reset_delay)
+
     def reset_state(self):
         """Re-enable image processing for the next throw."""
+        self._comm_print('reset_state_enter')
         self.state = 'IDLE'
         self.points = []
         self.get_logger().info('System reset. Ready for next bag.')
+        self._comm_print('reset_state_done')
     def find_red_centroid(self, bgr_image):
         """Detect the largest red blob and return its centroid (u, v) or None."""
         hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
@@ -161,6 +255,8 @@ class BeanBagTracker(Node):
 
     def compute_and_publish(self):
         """Fit trajectory to collected points, predict landing, publish result."""
+        t_compute0 = time.monotonic()
+        self._comm_print('compute_enter', n_points=len(self.points))
         # Sort points by time (just in case)
         self.points.sort(key=lambda p: p[0])
         t0 = self.points[0][0]
@@ -170,10 +266,15 @@ class BeanBagTracker(Node):
         zs = np.array([p[3] for p in self.points])
 
         # Fit linear models for x and z
+        t_fit0 = time.monotonic()
         coeffs_x = np.polyfit(times, xs, 1)   # [vx, x0]
         coeffs_z = np.polyfit(times, zs, 1)   # [vz, z0]
         # Fit quadratic for y (gravity)
         coeffs_y = np.polyfit(times, ys, 2)   # [a/2, vy, y0]
+        self._comm_print(
+            'compute_polyfit_done',
+            polyfit_ms=f'{(time.monotonic() - t_fit0) * 1000.0:.3f}',
+        )
 
         # Extract coefficients
         vx, x0 = coeffs_x
@@ -185,12 +286,14 @@ class BeanBagTracker(Node):
         # Solve vz * t + z0 = hole_distance
         if abs(vz) < 1e-6:
             self.get_logger().warn('vz near zero, cannot predict landing')
+            self._comm_print('compute_abort_vz_near_zero', vz=vz)
             return
         t_land = (self.hole_distance - z0) / vz
 
         # Check if t_land is positive and reasonable (e.g., < 5 sec)
         if t_land < 0 or t_land > 5.0:
             self.get_logger().warn(f'Predicted landing time {t_land:.2f}s out of range')
+            self._comm_print('compute_abort_t_land_range', t_land=t_land)
             return
 
         # Compute landing coordinates
@@ -215,8 +318,19 @@ class BeanBagTracker(Node):
 
         
         send_msg = dist + "," + ang
+        self._comm_print(
+            'compute_before_publish',
+            distance_in=distance,
+            angle_rad=angle,
+            t_land_s=t_land,
+        )
+        t_pub = time.monotonic()
         self.publisher.publish(msg)
-
+        self._comm_print(
+            'compute_after_publish',
+            publish_ms=f'{(time.monotonic() - t_pub) * 1000.0:.3f}',
+            compute_total_ms=f'{(time.monotonic() - t_compute0) * 1000.0:.3f}',
+        )
 
         self.get_logger().info(f'Published: distance={distance:.2f} in, angle={angle:.3f} rad')
 
@@ -239,6 +353,7 @@ class BeanBagTracker(Node):
 
     def collection_timeout_cb(self):
         """Called when no new point arrives within timeout."""
+        self._comm_print('collection_timeout_cb')
         self.get_logger().info('Collection timeout, resetting to IDLE')
         self.cancel_timeout_timer()
         self.points.clear()
@@ -247,17 +362,19 @@ class BeanBagTracker(Node):
     def check_timeout(self):
         """Check if we are in COLLECTING and too much time passed since last point."""
         if self.state == 'COLLECTING' and self.timeout_timer is None:
-            # Shouldn't happen, but safety
+            self._comm_print('check_timeout_safety_path')
             self.collection_timeout_cb()
 
     def reset(self):
         """Reset after 10s wait period."""
+        self._comm_print('reset_method_enter')
         if self.reset_timer is not None:
             self.reset_timer.cancel()
             self.reset_timer = None
         self.state = 'IDLE'
         self.points.clear()
         self.get_logger().info('Reset complete, ready for next throw')
+        self._comm_print('reset_method_done')
 
 def main(args=None):
     rclpy.init(args=args)
