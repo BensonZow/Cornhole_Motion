@@ -44,7 +44,7 @@ MOTOR_PERM: Tuple[int, int, int, int] = (0, 1, 2, 3)
 _WHEEL_ANGLE_OFFSETS = (0.0, math.pi / 2, -math.pi, -math.pi / 2)
 
 # After each non-zero drive command, wait then send 0,0,0,0 (CLI default; override with --stop-after)
-STOP_AFTER_COMMAND_S = 1.0
+STOP_AFTER_COMMAND_S = 0.5
 
 
 class SpeedLimitDerived(NamedTuple):

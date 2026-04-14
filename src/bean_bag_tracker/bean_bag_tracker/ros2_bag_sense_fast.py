@@ -31,7 +31,6 @@ class BeanBagTracker(Node):
         self.declare_parameter('depth_topic', '/camera/camera/depth/image_rect_raw')
         self.declare_parameter('camera_info_topic', '/camera/camera/depth/camera_info')
         self.declare_parameter('result_topic', '/bean_bag_trajectory')
-        self.declare_parameter('collection_timeout_sec', 2.0)
         self.declare_parameter('reset_delay_sec', 10.0)
         self.declare_parameter('min_publish_interval_sec', 5.0)
         # Max horizontal miss (m, Euclidean from hole) for publishing / motion; larger → no publish, keyboard still arms.
@@ -39,7 +38,6 @@ class BeanBagTracker(Node):
 
         self.hole_distance = self.get_parameter('hole_distance_inches').value * INCH_TO_METERS
         self.max_z = self.get_parameter('max_z_meters').value
-        self.collection_timeout = self.get_parameter('collection_timeout_sec').value
         self.min_publish_interval = float(self.get_parameter('min_publish_interval_sec').value)
         self.max_publish_distance_m = float(self.get_parameter('max_publish_distance_m').value)
 
@@ -60,8 +58,6 @@ class BeanBagTracker(Node):
         # Begin in WAIT until first Enter (same path as post-trajectory keyboard arm).
         self.state = 'WAIT'  # IDLE, COLLECTING, WAIT
         self.points = []              # list of (timestamp, x, y, z) in meters
-        self.collection_start_time = None
-        self.timeout_timer = None
         self.reset_timer = None
         # Use a Reentrant group so the timer and subscriber can run simultaneously
         self.callback_group = ReentrantCallbackGroup()
@@ -156,8 +152,6 @@ class BeanBagTracker(Node):
         t2 = time.monotonic()
 
         if centroid is None:
-            if self.state == 'COLLECTING':
-                self.check_timeout()
             self._comm_print(
                 'image_cb_no_centroid',
                 stamp=stamp,
@@ -175,8 +169,6 @@ class BeanBagTracker(Node):
         t4 = time.monotonic()
 
         if not (0.2 < depth < 4.0):
-            if self.state == 'COLLECTING':
-                self.check_timeout()
             self._comm_print(
                 'image_cb_depth_reject',
                 stamp=stamp,
@@ -215,7 +207,6 @@ class BeanBagTracker(Node):
                 self._comm_print('collect_start_idle_to_collecting', u=u, v=v)
                 self.points = [(t, x, y, depth)]
                 self.state = 'COLLECTING'
-                self.start_timeout_timer()
 
             # Add subsequent points
             elif self.state == 'COLLECTING':
@@ -227,15 +218,11 @@ class BeanBagTracker(Node):
                     v=v,
                 )
 
-                if len(self.points) < self.required_points:
-                    self.restart_timeout_timer()
-
                 # TRIGGER: Once we hit 3, calculate and SHUT DOWN processing
                 if len(self.points) >= self.required_points:
                     self.get_logger().info(
                         f'Captured {self.required_points} frames. Calculating trajectory...')
                     self._comm_print('collect_complete_trigger_compute', n=len(self.points))
-                    self.cancel_timeout_timer()
                     t_compute = time.monotonic()
                     published, arm_keyboard = self.compute_and_publish()
                     self._comm_print(
@@ -446,38 +433,6 @@ class BeanBagTracker(Node):
         )
 
         return (True, True)
-
-    def start_timeout_timer(self):
-        """Start or restart the timeout timer for collection."""
-        self.cancel_timeout_timer()
-        self.timeout_timer = self.create_timer(
-            self.collection_timeout,
-            self.collection_timeout_cb,
-            callback_group=self.callback_group,
-        )
-
-    def restart_timeout_timer(self):
-        self.cancel_timeout_timer()
-        self.start_timeout_timer()
-
-    def cancel_timeout_timer(self):
-        if self.timeout_timer is not None:
-            self.timeout_timer.cancel()
-            self.timeout_timer = None
-
-    def collection_timeout_cb(self):
-        """Called when no new point arrives within timeout."""
-        self._comm_print('collection_timeout_cb')
-        self.get_logger().info('Collection timeout, resetting to IDLE')
-        self.cancel_timeout_timer()
-        with self._state_lock:
-            self._apply_idle_reset()
-
-    def check_timeout(self):
-        """Check if we are in COLLECTING and too much time passed since last point."""
-        if self.state == 'COLLECTING' and self.timeout_timer is None:
-            self._comm_print('check_timeout_safety_path')
-            self.collection_timeout_cb()
 
     def reset(self):
         """Reset after 10s wait period."""
