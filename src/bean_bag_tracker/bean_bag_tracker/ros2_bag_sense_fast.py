@@ -23,7 +23,7 @@ class BeanBagTracker(Node):
         # Parameters (adjustable via ROS params)
         self.declare_parameter('comm_timing', False)
         self.declare_parameter('hole_distance_inches', 10.0)
-        self.declare_parameter('max_z_meters', 3.0)
+        self.declare_parameter('max_z_meters', 5.0)
         self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('depth_topic', '/camera/camera/depth/image_rect_raw')
         self.declare_parameter('camera_info_topic', '/camera/camera/depth/camera_info')
@@ -48,6 +48,8 @@ class BeanBagTracker(Node):
         self._state_lock = threading.Lock()
         self._pending_keyboard_reset = False
         self._stdin_arm_thread: threading.Thread | None = None
+        # One INFO bundle when bag is seen with depth <= max_z (reset on IDLE).
+        self._depth_milestone_pending = True
 
         # Camera intrinsics (filled when CameraInfo received)
         self.fx = self.fy = self.cx = self.cy = None
@@ -116,7 +118,12 @@ class BeanBagTracker(Node):
             self.fy = msg.k[4]
             self.cx = msg.k[2]
             self.cy = msg.k[5]
-            self.get_logger().info('Camera intrinsics received')
+            self.get_logger().info(
+                f'CameraInfo: frame_id={msg.header.frame_id} '
+                f'resolution={msg.width}x{msg.height} px '
+                f'fx={self.fx:.4f} px fy={self.fy:.4f} px cx={self.cx:.4f} px cy={self.cy:.4f} px '
+                f'distortion_model={msg.distortion_model}'
+            )
             self._comm_print(
                 'camera_intrinsics_set',
                 parse_ms=f'{(time.monotonic() - t0) * 1000.0:.3f}',
@@ -167,9 +174,6 @@ class BeanBagTracker(Node):
         depth_raw_u16 = int(depth_image[v, u])
         depth = depth_raw_u16 / 1000.0
         t4 = time.monotonic()
-        self.get_logger().info(
-            f'Depth sample (cv): u={u} v={v} raw={depth_raw_u16} depth={depth:.4f} m'
-        )
 
         if not (0.2 < depth < 4.0):
             if self.state == 'COLLECTING':
@@ -182,9 +186,29 @@ class BeanBagTracker(Node):
             )
             return
 
+        t = Time.from_msg(color_msg.header.stamp).nanoseconds / 1e9
+
+        if self._depth_milestone_pending and depth <= float(self.max_z):
+            self.get_logger().info(
+                'Bag + depth (once, z<=max_z): '
+                f'depth={depth:.4f} m (raw_uint16={depth_raw_u16}, typically mm in image); '
+                f'max_z={float(self.max_z):.4f} m; '
+                f'CameraInfo K: fx={self.fx:.4f} px fy={self.fy:.4f} px cx={self.cx:.4f} px cy={self.cy:.4f} px; '
+                f'color_Image: {color_msg.width}x{color_msg.height} px encoding={color_msg.encoding}; '
+                f'stamp_t={t:.6f} s (ROS image time)'
+            )
+            self._depth_milestone_pending = False
+
         x = (u - self.cx) * depth / self.fx
         y = (v - self.cy) * depth / self.fy
-        t = Time.from_msg(color_msg.header.stamp).nanoseconds / 1e9
+
+        self.get_logger().info(
+            'Track frame: '
+            f'stamp_t={t:.6f} s; color_Image {color_msg.width}x{color_msg.height} px '
+            f'encoding={color_msg.encoding}; '
+            f'depth={depth:.4f} m raw_uint16={depth_raw_u16}; '
+            f'centroid=({u},{v}) px; camera_xyz=({x:.4f},{y:.4f},{depth:.4f}) m'
+        )
 
         self._comm_print(
             'image_cb_frame_timing',
@@ -252,6 +276,7 @@ class BeanBagTracker(Node):
                     else:
                         self.points.clear()
                         self.state = 'IDLE'
+                        self._depth_milestone_pending = True
                         self.get_logger().info(
                             'Trajectory compute skipped (cooldown); reset to IDLE for next detection.')
 
@@ -291,6 +316,7 @@ class BeanBagTracker(Node):
         self._pending_keyboard_reset = False
         self.state = 'IDLE'
         self.points.clear()
+        self._depth_milestone_pending = True
 
     def reset_state(self):
         """Re-enable image processing for the next throw."""
@@ -393,6 +419,14 @@ class BeanBagTracker(Node):
         x_land = vx * t_land + x0
         y_land = a_half * t_land**2 + vy * t_land + y0
 
+        self.get_logger().info(
+            'Fit landing: '
+            f'polyfit x(t): vx={vx:.4f} m/s x0={x0:.4f} m; z(t): vz={vz:.4f} m/s z0={z0:.4f} m; '
+            f'y(t): a/2={a_half:.4f} m/s^2 vy={vy:.4f} m/s y0={y0:.4f} m; '
+            f'hole_plane_z={self.hole_distance:.4f} m; t_land={t_land:.4f} s; '
+            f'landing_xy=({x_land:.4f},{y_land:.4f}) m'
+        )
+
         # Offsets from hole (hole at x=0, y=0), meters
         dx = x_land
         dy = y_land
@@ -422,6 +456,7 @@ class BeanBagTracker(Node):
             t_land_s=t_land,
         )
         t_pub = time.monotonic()
+        topic = self.get_parameter('result_topic').value
         self.publisher.publish(msg)
         self._last_publish_mono = time.monotonic()
         self._comm_print(
@@ -431,7 +466,9 @@ class BeanBagTracker(Node):
         )
 
         self.get_logger().info(
-            f'Published: distance={distance_m:.3f} m, angle={angle:.3f} rad'
+            f'Published ROS std_msgs/Float32MultiArray on {topic!r}: '
+            f'data[0]={distance_m:.4f} m (horizontal miss), '
+            f'data[1]={angle:.4f} rad (atan2 miss direction)'
         )
 
         return (True, True)
