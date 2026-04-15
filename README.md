@@ -1,6 +1,10 @@
 ROS2 Tutorial 
 https://docs.ros.org/en/jazzy/Installation/Alternatives/Ubuntu-Development-Setup.html
 
+ip address 
+
+10.201.82.18
+
 Realsense 
 https://github.com/realsenseai/realsense-ros?tab=readme-ov-file
 
