@@ -145,53 +145,31 @@ class TrackerSubscriber(Node):
         )
 
     def listener_callback(self, msg: Float32MultiArray):
-        # We replace the 'sys.stdin' / 'argv' logic here.
-        # Assuming msg.data contains [val1, val2]
+        """Always interpret ``msg.data`` as ``[distance_m, heading_rad]`` (e.g. from bean_bag_trajectory)."""
         if len(msg.data) < 2:
             return
 
         self._comm_print("callback_enter", msg_len=len(msg.data))
 
-        pwms = [0, 0, 0, 0]
-        
-        # --- ALL YOUR ORIGINAL CONDITIONALS INTEGRATED ---
-        
-        # Scenario A: Interpreting data as [distance, heading] (replaces --stdin and --distance)
-        if self.args.stdin or self.args.distance is not None:
-            dist_m = msg.data[0]
-            # Handle heading vs heading_deg logic
-            if self.args.heading_deg is not None:
-                heading_rad = math.radians(self.args.heading_deg)
-            else:
-                heading_rad = msg.data[1] # Assume second float is radians
-
-            if abs(dist_m) > self.lim.max_distance_allowed_m:
-                self.get_logger().warn(f"Rejected |dist|={abs(dist_m):g} (max {self.lim.max_distance_allowed_m:g})")
-                self._comm_print("reject_distance", dist_m=dist_m)
-                return
-
-            pwms = pwm_from_distance_heading(
-                dist_m,
-                heading_rad,
-                alpha_rad=self.args.alpha,
-                pwm_ref_m_s=self.args.pwm_ref,
-            )
-
-        # Scenario B: Interpreting data as [vx, vy]
-        elif self.args.vx is not None or (len(msg.data) == 2 and self.args.distance is None):
-            vx = msg.data[0]
-            vy = msg.data[1]
-            pwms = pwm_from_body_velocity(
-                float(vx),
-                float(vy),
-                alpha_rad=self.args.alpha,
-                pwm_ref_m_s=self.args.pwm_ref,
-            )
-
+        dist_m = float(msg.data[0])
+        if self.args.heading_deg is not None:
+            heading_rad = math.radians(self.args.heading_deg)
         else:
-            self.get_logger().error("Node configuration does not match incoming data format")
-            self._comm_print("reject_bad_config")
+            heading_rad = float(msg.data[1])
+
+        if abs(dist_m) > self.lim.max_distance_allowed_m:
+            self.get_logger().warn(
+                f"Rejected |dist|={abs(dist_m):g} (max {self.lim.max_distance_allowed_m:g})"
+            )
+            self._comm_print("reject_distance", dist_m=dist_m)
             return
+
+        pwms = pwm_from_distance_heading(
+            dist_m,
+            heading_rad,
+            alpha_rad=self.args.alpha,
+            pwm_ref_m_s=self.args.pwm_ref,
+        )
 
         self._comm_print("after_compute", pwms=str(pwms))
 
@@ -402,11 +380,13 @@ def main(args=None):
     parser.add_argument("--alpha", type=float, default=ALPHA_RAD)
     parser.add_argument("--pwm-ref", type=float, default=PWM_REF_WHEEL_M_S)
     parser.add_argument("--stop-after", type=float, default=STOP_AFTER_COMMAND_S)
-    # Logic flags for input interpretation
-    parser.add_argument("--stdin", action="store_true")
-    parser.add_argument("--distance", type=float, help="Explicit distance mode")
-    parser.add_argument("--heading-deg", type=float, help="Heading in degrees override")
-    parser.add_argument("--vx", type=float, help="Explicit vx mode")
+    # Optional: ignore message heading and use this heading (degrees) for PWM instead.
+    parser.add_argument(
+        "--heading-deg",
+        type=float,
+        default=None,
+        help="If set, use this heading (degrees) instead of msg.data[1] (radians)",
+    )
     parser.add_argument(
         "--comm-timing",
         action="store_true",

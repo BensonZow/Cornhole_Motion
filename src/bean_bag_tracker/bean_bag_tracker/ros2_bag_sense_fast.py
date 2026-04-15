@@ -164,8 +164,12 @@ class BeanBagTracker(Node):
         u, v = centroid
         t3 = time.monotonic()
         depth_image = self.bridge.imgmsg_to_cv2(depth_msg, '16UC1')
-        depth = depth_image[v, u] / 1000.0
+        depth_raw_u16 = int(depth_image[v, u])
+        depth = depth_raw_u16 / 1000.0
         t4 = time.monotonic()
+        self.get_logger().info(
+            f'Depth sample (cv): u={u} v={v} raw={depth_raw_u16} depth={depth:.4f} m'
+        )
 
         if not (0.2 < depth < 4.0):
             if self.state == 'COLLECTING':
