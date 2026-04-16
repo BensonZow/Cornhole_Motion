@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import math
+import os
 import sys
 import threading
 import time
@@ -14,6 +15,9 @@ import message_filters
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.time import Time
+
+# 3D trajectory debug PNGs (matplotlib Agg).
+TRAJECTORY_DEBUG_PLOT_DIR = '/home/cornholio/ros2_jazzy/log'
 
 
 def _wait_for_confirm_y_line() -> None:
@@ -40,7 +44,7 @@ class BeanBagTracker(Node):
 
         # Parameters (adjustable via ROS params)
         self.declare_parameter('hole_distance_inches', 10.0)
-        self.declare_parameter('max_z_meters', 5.0)
+        self.declare_parameter('max_z_meters', 1.0)
         self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('depth_topic', '/camera/camera/depth/image_rect_raw')
         # Meters per raw depth unit (e.g. RealSense depth_sensor.get_depth_scale() often 0.001).
@@ -242,10 +246,9 @@ class BeanBagTracker(Node):
         """Single INFO log per completed 3-point bag cycle (distance math only)."""
         self.get_logger().info('\n'.join(lines))
 
-    def _show_trajectory_debug_plot_3d(
+    def _save_trajectory_debug_plot_3d(
         self,
         *,
-        times: np.ndarray,
         xs: np.ndarray,
         ys: np.ndarray,
         depths: np.ndarray,
@@ -262,64 +265,65 @@ class BeanBagTracker(Node):
         depth_land: float | None,
         zh: float,
     ) -> None:
-        """Open a short-lived GUI window with (x, y_cam, depth) 3D plot (runs on a background thread)."""
-        duration = 5.0
-        times_c = np.asarray(times, dtype=float).copy()
+        """Save (x, y_cam, depth) 3D PNG under TRAJECTORY_DEBUG_PLOT_DIR (matplotlib Agg)."""
+        try:
+            import matplotlib
+
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+        except ImportError:
+            self.get_logger().warn('matplotlib not installed; skipping 3d debug plot PNG')
+            return
+
+        out_dir = TRAJECTORY_DEBUG_PLOT_DIR
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as e:
+            self.get_logger().warn(f'Could not create trajectory plot dir {out_dir!r}: {e}')
+            return
+
         xs_c = np.asarray(xs, dtype=float).copy()
         ys_c = np.asarray(ys, dtype=float).copy()
         depths_c = np.asarray(depths, dtype=float).copy()
 
-        def worker() -> None:
-            try:
-                import matplotlib
+        fig = plt.figure(figsize=(7, 6))
+        ax = fig.add_subplot(111, projection='3d')
 
-                matplotlib.use('TkAgg')
-                import matplotlib.pyplot as plt
-            except ImportError:
-                self.get_logger().warn('matplotlib not installed; skipping 3d debug plot window')
-                return
-            except Exception as e:
-                self.get_logger().warn(f'3d plot window unavailable ({e!r}); need DISPLAY and TkAgg')
-                return
+        ax.scatter([0.0], [0.0], [0.0], c='k', s=80, marker='^', label='camera')
+        ax.plot(xs_c, ys_c, depths_c, 'b-', alpha=0.5, linewidth=1)
+        ax.scatter(xs_c, ys_c, depths_c, c='blue', s=35, label='3 samples')
+        ax.scatter([xs_c[0]], [ys_c[0]], [depths_c[0]], c='orange', s=120, marker='o', label='bag frame 1 (earliest)')
 
-            fig = plt.figure(figsize=(7, 6))
-            ax = fig.add_subplot(111, projection='3d')
+        if t_land is not None and x_land is not None and y_land is not None and depth_land is not None:
+            if math.isfinite(t_land):
+                n = max(25, int(40 * (1.0 + min(abs(t_land), 5.0))))
+                tt = np.linspace(0.0, float(t_land), n)
+                arc_x = np.polyval(np.array([vx, x0]), tt)
+                arc_y = np.polyval(np.array([a_half, vy, y0]), tt)
+                arc_z = np.polyval(np.array([vz, z0]), tt)
+                ax.plot(arc_x, arc_y, arc_z, 'g--', alpha=0.7, linewidth=1.2, label='fit arc to t_land')
+            ax.scatter(
+                [x_land], [y_land], [depth_land],
+                c='red', s=140, marker='*', label='predicted landing',
+            )
 
-            ax.scatter([0.0], [0.0], [0.0], c='k', s=80, marker='^', label='camera')
-            ax.plot(xs_c, ys_c, depths_c, 'b-', alpha=0.5, linewidth=1)
-            ax.scatter(xs_c, ys_c, depths_c, c='blue', s=35, label='3 samples')
-            ax.scatter([xs_c[0]], [ys_c[0]], [depths_c[0]], c='orange', s=120, marker='o', label='bag frame 1 (earliest)')
+        ax.set_xlabel('x (m)')
+        ax.set_ylabel('y_cam (m)')
+        ax.set_zlabel('depth (m)')
+        ax.set_title('Trajectory debug (camera frame)')
+        ax.legend(loc='upper left', fontsize=8)
+        fig.text(0.02, 0.02, f'z_hole (range ref) = {zh:.4f} m', fontsize=8)
+        fig.tight_layout()
 
-            if t_land is not None and x_land is not None and y_land is not None and depth_land is not None:
-                if math.isfinite(t_land):
-                    n = max(25, int(40 * (1.0 + min(abs(t_land), 5.0))))
-                    tt = np.linspace(0.0, float(t_land), n)
-                    arc_x = np.polyval(np.array([vx, x0]), tt)
-                    arc_y = np.polyval(np.array([a_half, vy, y0]), tt)
-                    arc_z = np.polyval(np.array([vz, z0]), tt)
-                    ax.plot(arc_x, arc_y, arc_z, 'g--', alpha=0.7, linewidth=1.2, label='fit arc to t_land')
-                ax.scatter(
-                    [x_land], [y_land], [depth_land],
-                    c='red', s=140, marker='*', label='predicted landing',
-                )
+        out_path = os.path.join(out_dir, f'trajectory_debug_{time.time_ns()}.png')
+        try:
+            fig.savefig(out_path, dpi=120)
+        except OSError as e:
+            self.get_logger().warn(f'Could not write trajectory plot {out_path!r}: {e}')
+        finally:
+            plt.close(fig)
 
-            ax.set_xlabel('x (m)')
-            ax.set_ylabel('y_cam (m)')
-            ax.set_zlabel('depth (m)')
-            ax.set_title('Trajectory debug (camera frame)')
-            ax.legend(loc='upper left', fontsize=8)
-            fig.text(0.02, 0.02, f'z_hole (range ref) = {zh:.4f} m', fontsize=8)
-            fig.tight_layout()
-            try:
-                plt.show(block=False)
-                plt.pause(duration)
-            finally:
-                plt.close(fig)
-
-        threading.Thread(target=worker, daemon=True).start()
-        self.get_logger().info(
-            f'Opened 3d trajectory debug window (~{duration:.0f}s); requires DISPLAY and TkAgg'
-        )
+        self.get_logger().info(f'Wrote 3d trajectory debug plot: {out_path}')
 
     def compute_and_publish(self) -> tuple[bool, bool]:
         """Fit trajectory, predict landing. Returns (published, arm_keyboard).
@@ -380,8 +384,7 @@ class BeanBagTracker(Node):
             lines.append(f'  vz={vz:.6e}  => |vz|<1e-6, t_land undefined (division by zero)')
             lines.append('  outcome: vz_near_zero (no /bean_bag_trajectory publish)')
             self._emit_bag_distance_backtrack(lines)
-            self._show_trajectory_debug_plot_3d(
-                times=times,
+            self._save_trajectory_debug_plot_3d(
                 xs=xs,
                 ys=ys,
                 depths=depths,
@@ -440,8 +443,7 @@ class BeanBagTracker(Node):
                 f'(distance_m > max_publish_distance_m; no publish on {topic!r})'
             )
             self._emit_bag_distance_backtrack(lines)
-            self._show_trajectory_debug_plot_3d(
-                times=times,
+            self._save_trajectory_debug_plot_3d(
                 xs=xs,
                 ys=ys,
                 depths=depths,
@@ -469,8 +471,7 @@ class BeanBagTracker(Node):
             f'data=[distance_m, angle_rad]=[{distance_m:.6f}, {angle:.6f}]'
         )
         self._emit_bag_distance_backtrack(lines)
-        self._show_trajectory_debug_plot_3d(
-            times=times,
+        self._save_trajectory_debug_plot_3d(
             xs=xs,
             ys=ys,
             depths=depths,
