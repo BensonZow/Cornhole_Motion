@@ -43,17 +43,16 @@ class BeanBagTracker(Node):
         self.declare_parameter('max_z_meters', 5.0)
         self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('depth_topic', '/camera/camera/depth/image_rect_raw')
+        # Meters per raw depth unit (e.g. RealSense depth_sensor.get_depth_scale() often 0.001).
+        self.declare_parameter('depth_scale', 0.001)
         self.declare_parameter('camera_info_topic', '/camera/camera/depth/camera_info')
         self.declare_parameter('result_topic', '/bean_bag_trajectory')
         self.declare_parameter('reset_delay_sec', 10.0)
         self.declare_parameter('min_publish_interval_sec', 5.0)
         # Max miss (m): hypot(x_land, depth_land - z_hole); larger → no publish, keyboard still arms.
         self.declare_parameter('max_publish_distance_m', 0.5)
-        # Camera-frame y (m) at which t_land is solved: y(t_land) = y_hole_m (hole-at-origin → 0).
-        self.declare_parameter('y_hole_m', 0.0)
-
         self.hole_distance = self.get_parameter('hole_distance_inches').value * 0.0254  # convert to meters
-        self.y_hole_m = float(self.get_parameter('y_hole_m').value)
+        self.depth_scale = float(self.get_parameter('depth_scale').value)
         self.min_publish_interval = float(self.get_parameter('min_publish_interval_sec').value)
         self.max_publish_distance_m = float(self.get_parameter('max_publish_distance_m').value)
 
@@ -96,6 +95,10 @@ class BeanBagTracker(Node):
             0.05, self._keyboard_poll_callback, callback_group=self.callback_group)
 
         self.get_logger().info('Bean Bag Tracker node started')
+        self.get_logger().info(
+            f'Depth scale is: {self.depth_scale} m/raw_unit '
+            '(ROS param depth_scale; same role as depth_sensor.get_depth_scale())'
+        )
 
     def camera_info_callback(self, msg):
         """Extract camera intrinsics once."""
@@ -120,7 +123,8 @@ class BeanBagTracker(Node):
         # 2. Extract 3D data
         u, v = centroid
         depth_image = self.bridge.imgmsg_to_cv2(depth_msg, '16UC1')
-        depth = int(depth_image[v, u]) / 1000.0
+        depth_raw_u16 = int(depth_image[v, u])
+        depth = depth_raw_u16 * self.depth_scale
 
         if not (0.2 < depth < 4.0):
             return
@@ -215,8 +219,17 @@ class BeanBagTracker(Node):
         cy = int(M['m01'] / M['m00'])
         return (cx, cy)
 
+    def _backtrack_depth_scale_line(self) -> str:
+        return (
+            f'  Depth scale is: {self.depth_scale} m/raw_unit  '
+            f'(depth_m = uint16_depth * depth_scale; cf. depth_sensor.get_depth_scale())'
+        )
+
     def _backtrack_sample_point_lines(self, t0: float) -> list[str]:
-        lines: list[str] = ['  samples (t, x, y_cam, depth_m):']
+        lines: list[str] = [
+            self._backtrack_depth_scale_line(),
+            '  samples (t, x, y_cam, depth_m from uint16 * depth_scale):',
+        ]
         for i, (t_abs, xi, yi, di) in enumerate(self.points):
             tr = t_abs - t0
             lines.append(
@@ -229,11 +242,91 @@ class BeanBagTracker(Node):
         """Single INFO log per completed 3-point bag cycle (distance math only)."""
         self.get_logger().info('\n'.join(lines))
 
+    def _show_trajectory_debug_plot_3d(
+        self,
+        *,
+        times: np.ndarray,
+        xs: np.ndarray,
+        ys: np.ndarray,
+        depths: np.ndarray,
+        vx: float,
+        x0: float,
+        a_half: float,
+        vy: float,
+        y0: float,
+        vz: float,
+        z0: float,
+        t_land: float | None,
+        x_land: float | None,
+        y_land: float | None,
+        depth_land: float | None,
+        zh: float,
+    ) -> None:
+        """Open a short-lived GUI window with (x, y_cam, depth) 3D plot (runs on a background thread)."""
+        duration = 5.0
+        times_c = np.asarray(times, dtype=float).copy()
+        xs_c = np.asarray(xs, dtype=float).copy()
+        ys_c = np.asarray(ys, dtype=float).copy()
+        depths_c = np.asarray(depths, dtype=float).copy()
+
+        def worker() -> None:
+            try:
+                import matplotlib
+
+                matplotlib.use('TkAgg')
+                import matplotlib.pyplot as plt
+            except ImportError:
+                self.get_logger().warn('matplotlib not installed; skipping 3d debug plot window')
+                return
+            except Exception as e:
+                self.get_logger().warn(f'3d plot window unavailable ({e!r}); need DISPLAY and TkAgg')
+                return
+
+            fig = plt.figure(figsize=(7, 6))
+            ax = fig.add_subplot(111, projection='3d')
+
+            ax.scatter([0.0], [0.0], [0.0], c='k', s=80, marker='^', label='camera')
+            ax.plot(xs_c, ys_c, depths_c, 'b-', alpha=0.5, linewidth=1)
+            ax.scatter(xs_c, ys_c, depths_c, c='blue', s=35, label='3 samples')
+            ax.scatter([xs_c[0]], [ys_c[0]], [depths_c[0]], c='orange', s=120, marker='o', label='bag frame 1 (earliest)')
+
+            if t_land is not None and x_land is not None and y_land is not None and depth_land is not None:
+                if math.isfinite(t_land):
+                    n = max(25, int(40 * (1.0 + min(abs(t_land), 5.0))))
+                    tt = np.linspace(0.0, float(t_land), n)
+                    arc_x = np.polyval(np.array([vx, x0]), tt)
+                    arc_y = np.polyval(np.array([a_half, vy, y0]), tt)
+                    arc_z = np.polyval(np.array([vz, z0]), tt)
+                    ax.plot(arc_x, arc_y, arc_z, 'g--', alpha=0.7, linewidth=1.2, label='fit arc to t_land')
+                ax.scatter(
+                    [x_land], [y_land], [depth_land],
+                    c='red', s=140, marker='*', label='predicted landing',
+                )
+
+            ax.set_xlabel('x (m)')
+            ax.set_ylabel('y_cam (m)')
+            ax.set_zlabel('depth (m)')
+            ax.set_title('Trajectory debug (camera frame)')
+            ax.legend(loc='upper left', fontsize=8)
+            fig.text(0.02, 0.02, f'z_hole (range ref) = {zh:.4f} m', fontsize=8)
+            fig.tight_layout()
+            try:
+                plt.show(block=False)
+                plt.pause(duration)
+            finally:
+                plt.close(fig)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.get_logger().info(
+            f'Opened 3d trajectory debug window (~{duration:.0f}s); requires DISPLAY and TkAgg'
+        )
+
     def compute_and_publish(self) -> tuple[bool, bool]:
         """Fit trajectory, predict landing. Returns (published, arm_keyboard).
 
-        Linear fits on t_rel: x, y_cam (for t_land via y_cam=y_hole_m), depth.
-        Miss: hypot(x_land, depth_land - z_hole); angle atan2(d_depth, x_land).
+        Linear ``x(t)``, linear ``depth(t)`` for ``t_land`` where ``depth(t_land)=z_hole``;
+        quadratic ``y(t)`` (gravity along image vertical); ``y_land`` evaluated at ``t_land``.
+        Miss: ``hypot(x_land, depth_land - z_hole)``; angle ``atan2(d_depth, x_land)``.
 
         ``published`` is True only if a message was sent. ``arm_keyboard`` is True
         to enter WAIT + stdin (all finished cycles except compute aborted on cooldown).
@@ -245,11 +338,12 @@ class BeanBagTracker(Node):
         if now - self._last_publish_mono < self.min_publish_interval:
             lines = [
                 '--- bag distance backtrack ---',
+                self._backtrack_depth_scale_line(),
                 'outcome: publish_cooldown (no trajectory message; landing math not run)',
                 f'  elapsed_since_last_publish_s={now - self._last_publish_mono:.6f}  '
                 f'min_publish_interval_s={self.min_publish_interval:.6f}',
             ]
-            lines.extend(self._backtrack_sample_point_lines(t0))
+            lines.extend(self._backtrack_sample_point_lines(t0)[1:])
             self._emit_bag_distance_backtrack(lines)
             return (False, False)
 
@@ -258,52 +352,75 @@ class BeanBagTracker(Node):
         ys = np.array([p[2] for p in self.points])
         depths = np.array([p[3] for p in self.points])
 
-        coeffs_x = np.polyfit(times, xs, 1)   # [vx, x0]  => x(t)=vx*t+x0
-        coeffs_y_lin = np.polyfit(times, ys, 1)   # [vy, y0]  => y_cam(t)=vy*t+y0  (time solve)
-        coeffs_depth = np.polyfit(times, depths, 1)   # [vd, d0]  => depth(t)=vd*t+d0
+        coeffs_x = np.polyfit(times, xs, 1)
+        coeffs_y = np.polyfit(times, ys, 2)
+        coeffs_depth = np.polyfit(times, depths, 1)
 
         vx, x0 = coeffs_x
-        vy, y0 = coeffs_y_lin
-        vd, d0 = coeffs_depth
+        a_half, vy, y0 = coeffs_y
+        vz, z0 = coeffs_depth
 
         zh = float(self.hole_distance)
-        y_hole = float(self.y_hole_m)
         lines = [
             '--- bag distance backtrack ---',
         ]
         lines.extend(self._backtrack_sample_point_lines(t0))
         lines.append(
             f'  polyfit (t_rel from first sample): '
-            f'x(t)={vx:.6f}*t+{x0:.6f}  y_cam(t)={vy:.6f}*t+{y0:.6f}  '
-            f'depth(t)={vd:.6f}*t+{d0:.6f}'
+            f'x(t)={vx:.6f}*t+{x0:.6f}  '
+            f'y_cam(t)={a_half:.6f}*t^2+{vy:.6f}*t+{y0:.6f}  '
+            f'depth(t)={vz:.6f}*t+{z0:.6f}'
         )
         lines.append(
-            f'  t_land from y_cam(t_land)=y_hole: y_hole={y_hole:.6f}m  '
-            f'=> vy*t_land+y0=y_hole  => t_land=(y_hole-y0)/vy'
+            f'  t_land from depth to z_hole: depth(t_land)=z_hole={zh:.6f}m  '
+            f'=> vz*t_land+z0=zh  => t_land=(zh-z0)/vz'
         )
 
-        if abs(vy) < 1e-6:
-            lines.append(f'  vy={vy:.6e}  => |vy|<1e-6, t_land undefined (division by zero)')
-            lines.append('  outcome: vy_near_zero (no /bean_bag_trajectory publish)')
+        if abs(vz) < 1e-6:
+            lines.append(f'  vz={vz:.6e}  => |vz|<1e-6, t_land undefined (division by zero)')
+            lines.append('  outcome: vz_near_zero (no /bean_bag_trajectory publish)')
             self._emit_bag_distance_backtrack(lines)
+            self._show_trajectory_debug_plot_3d(
+                times=times,
+                xs=xs,
+                ys=ys,
+                depths=depths,
+                vx=vx,
+                x0=x0,
+                a_half=a_half,
+                vy=vy,
+                y0=y0,
+                vz=vz,
+                z0=z0,
+                t_land=None,
+                x_land=None,
+                y_land=None,
+                depth_land=None,
+                zh=zh,
+            )
             return (False, True)
 
-        t_land = (y_hole - y0) / vy
+        t_land = (zh - z0) / vz
         x_land = vx * t_land + x0
-        depth_land = vd * t_land + d0
+        y_land = float(np.polyval(np.array([a_half, vy, y0]), t_land))
+        depth_land = vz * t_land + z0
         dx = x_land
         d_depth = depth_land - zh
         distance_m = math.hypot(dx, d_depth)
         angle = math.atan2(d_depth, dx)
 
         lines.append(
-            f'  t_land = (y_hole-y0)/vy = ({y_hole:.6f}-{y0:.6f})/{vy:.6f} = {t_land:.6f} s'
+            f'  t_land = (zh-z0)/vz = ({zh:.6f}-{z0:.6f})/{vz:.6f} = {t_land:.6f} s'
         )
         lines.append(
             f'  x_land = vx*t_land+x0 = {vx:.6f}*{t_land:.6f}+{x0:.6f} = {x_land:.6f} m'
         )
         lines.append(
-            f'  depth_land = vd*t_land+d0 = {vd:.6f}*{t_land:.6f}+{d0:.6f} = {depth_land:.6f} m'
+            f'  y_land = (a/2)*t_land^2+vy*t_land+y0 = '
+            f'{a_half:.6f}*{t_land:.6f}^2+{vy:.6f}*{t_land:.6f}+{y0:.6f} = {y_land:.6f} m'
+        )
+        lines.append(
+            f'  depth_land = vz*t_land+z0 = {vz:.6f}*{t_land:.6f}+{z0:.6f} = {depth_land:.6f} m'
         )
         lines.append(f'  z_hole (range ref, m) = {zh:.6f}  => d_depth = depth_land - z_hole = {d_depth:.6f} m')
         lines.append(
@@ -323,6 +440,24 @@ class BeanBagTracker(Node):
                 f'(distance_m > max_publish_distance_m; no publish on {topic!r})'
             )
             self._emit_bag_distance_backtrack(lines)
+            self._show_trajectory_debug_plot_3d(
+                times=times,
+                xs=xs,
+                ys=ys,
+                depths=depths,
+                vx=vx,
+                x0=x0,
+                a_half=a_half,
+                vy=vy,
+                y0=y0,
+                vz=vz,
+                z0=z0,
+                t_land=t_land,
+                x_land=x_land,
+                y_land=y_land,
+                depth_land=depth_land,
+                zh=zh,
+            )
             return (False, True)
 
         msg = Float32MultiArray()
@@ -334,6 +469,24 @@ class BeanBagTracker(Node):
             f'data=[distance_m, angle_rad]=[{distance_m:.6f}, {angle:.6f}]'
         )
         self._emit_bag_distance_backtrack(lines)
+        self._show_trajectory_debug_plot_3d(
+            times=times,
+            xs=xs,
+            ys=ys,
+            depths=depths,
+            vx=vx,
+            x0=x0,
+            a_half=a_half,
+            vy=vy,
+            y0=y0,
+            vz=vz,
+            z0=z0,
+            t_land=t_land,
+            x_land=x_land,
+            y_land=y_land,
+            depth_land=depth_land,
+            zh=zh,
+        )
 
         return (True, True)
 
