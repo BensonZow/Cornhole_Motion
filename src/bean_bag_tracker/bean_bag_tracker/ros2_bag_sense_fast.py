@@ -51,7 +51,7 @@ class BeanBagTracker(Node):
 
         # Parameters (adjustable via ROS params)
         self.declare_parameter('hole_distance_inches', 10.0)
-        self.declare_parameter('max_z_meters', 1.0)
+        self.declare_parameter('max_z_meters', 4.0)
         self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('depth_topic', '/camera/camera/depth/image_rect_raw')
         # Meters per raw depth unit (e.g. RealSense depth_sensor.get_depth_scale() often 0.001).
