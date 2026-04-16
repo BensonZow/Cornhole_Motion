@@ -19,6 +19,16 @@ from rclpy.time import Time
 # 3D trajectory debug PNGs (matplotlib Agg).
 TRAJECTORY_DEBUG_PLOT_DIR = '/home/cornholio/ros2_jazzy/log'
 
+# Red bag HSV tuning (OpenCV BGR→HSV: H 0–179, S and V 0–255). Red wraps hue → two ranges.
+# Red bag HSV tuning (Higher saturation floor to kill orange/brown bleed)
+RED_HSV_1_LOWER = (0, 160, 60)   # Raised S from 55 -> 160
+RED_HSV_1_UPPER = (7, 255, 255)  # Tightened H from 12 -> 7
+
+RED_HSV_2_LOWER = (173, 160, 60) # Raised S from 55 -> 160, H from 168 -> 173
+RED_HSV_2_UPPER = (180, 255, 255)
+# Square kernel edge length for open/close (e.g. 3 = gentler than 5).
+RED_MASK_MORPH_KERNEL_SIZE = 3
+
 
 def _wait_for_confirm_y_line() -> None:
     """Block until the user types ``y`` and ends the line (Enter / Return).
@@ -120,7 +130,7 @@ class BeanBagTracker(Node):
             return
 
         color_image = self.bridge.imgmsg_to_cv2(color_msg, 'bgr8')
-        centroid = self.find_yellow_centroid(color_image)
+        centroid = self.find_red_centroid(color_image)
 
         if centroid is None:
             return
@@ -194,26 +204,31 @@ class BeanBagTracker(Node):
         self.points.clear()
         self._debug_first_frame_bgr = None
 
-    def _yellow_binary_mask_bgr(self, bgr: np.ndarray) -> np.ndarray:
-        """HSV yellow mask (8-bit) after morphology; same semantics as find_yellow_centroid pre-contours."""
+    def _red_binary_mask_bgr(self, bgr: np.ndarray) -> np.ndarray:
+        """HSV red mask (8-bit) after morphology; same semantics as find_red_centroid pre-contours."""
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        # Yellow ~ hue 18–40 (OpenCV H 0–179); relaxed S/V; keep below typical green (~45+).
-        lower = np.array([18, 55, 55])
-        upper = np.array([40, 255, 255])
-        mask = cv2.inRange(hsv, lower, upper)
+        lower1 = np.array(RED_HSV_1_LOWER, dtype=np.uint8)
+        upper1 = np.array(RED_HSV_1_UPPER, dtype=np.uint8)
+        lower2 = np.array(RED_HSV_2_LOWER, dtype=np.uint8)
+        upper2 = np.array(RED_HSV_2_UPPER, dtype=np.uint8)
 
-        kernel = np.ones((3, 3), np.uint8)
+        mask1 = cv2.inRange(hsv, lower1, upper1)
+        mask2 = cv2.inRange(hsv, lower2, upper2)
+        mask = cv2.bitwise_or(mask1, mask2)
+
+        k = max(1, int(RED_MASK_MORPH_KERNEL_SIZE))
+        kernel = np.ones((k, k), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         return mask
 
-    def _yellow_masked_bgr(self, bgr: np.ndarray) -> np.ndarray:
-        mask = self._yellow_binary_mask_bgr(bgr)
+    def _red_masked_bgr(self, bgr: np.ndarray) -> np.ndarray:
+        mask = self._red_binary_mask_bgr(bgr)
         return cv2.bitwise_and(bgr, bgr, mask=mask)
 
-    def find_yellow_centroid(self, bgr_image):
-        """Detect the largest yellow blob and return its centroid (u, v) or None."""
-        mask = self._yellow_binary_mask_bgr(bgr_image)
+    def find_red_centroid(self, bgr_image):
+        """Detect the largest red blob and return its centroid (u, v) or None."""
+        mask = self._red_binary_mask_bgr(bgr_image)
 
         # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -273,7 +288,7 @@ class BeanBagTracker(Node):
         zh: float,
         first_bgr: np.ndarray | None,
     ) -> None:
-        """Save dual-tile PNG: 3D trajectory (mpl X=x, Y=depth, Z=y_cam) + optional yellow-mask frame."""
+        """Save dual-tile PNG: 3D trajectory (mpl X=x, Y=depth, Z=y_cam) + optional red-mask frame."""
         try:
             import matplotlib
 
@@ -366,9 +381,9 @@ class BeanBagTracker(Node):
 
         ax_img = fig.add_subplot(1, 2, 2)
         if first_bgr is not None:
-            rgb = cv2.cvtColor(self._yellow_masked_bgr(first_bgr), cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(self._red_masked_bgr(first_bgr), cv2.COLOR_BGR2RGB)
             ax_img.imshow(rgb)
-            ax_img.set_title('Frame 1 (yellow mask)')
+            ax_img.set_title('Frame 1 (red mask)')
             ax_img.axis('off')
         else:
             ax_img.text(0.5, 0.5, 'no frame captured', ha='center', va='center', transform=ax_img.transAxes)
