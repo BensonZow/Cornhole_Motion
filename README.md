@@ -46,3 +46,24 @@ ls /dev/ttyACM*
 to write across serial port 
 On Pi in arduino_serial_com pkg 
 python3 serial_fast.py 
+
+## RUNNING THE ROBOT ### 
+ssh -X cornholio@10.201.82.18
+
+cd ros2_jazzy 
+open a terminal for each node that needs to be ran 
+
+ 
+
+Terminal 1 : Realse Sense Camera 
+source install/setup.bash
+ros2 launch realsense2_camera rs_launch.py initial_reset:=true
+
+Terminal 2 : Bean Bag Tracker 
+source install/setup.bash
+ros2 run bean_bag_tracker ros2_bag_sense_fast.py 
+
+Terminal 3 
+source install/setup.bash
+ros2 run arduino_serial_com omni_pwm_subscribe.py 
+
