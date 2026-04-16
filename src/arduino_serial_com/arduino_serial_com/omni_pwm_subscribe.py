@@ -13,12 +13,14 @@ import argparse
 import math
 import sys
 import time
-from typing import Iterable, List, NamedTuple, Sequence, Tuple
-import sys
+from typing import List, NamedTuple, Sequence, Tuple
+
 import rclpy
+import serial
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray
-import serial
 
 # --- Time horizon for distance → speed (plan: always 1 s) ---
 DT_S = 1.0
@@ -27,10 +29,8 @@ SPEED_LIMIT_FRACTION = 1.0
 
 # --- Geometry placeholders (ω = 0: L / half-axle does not affect v_i) ---
 ALPHA_RAD = 0.785  # first wheel angle vs robot +x (radians)
-WHEEL_RADIUS_M = 0.0485  # placeholder; v = r·ω if you relate to motor shaft later
-HALF_AXLE_LENGTH_M = 0.478  # placeholder for future yaw term
 # max speed is 350 rpm
-#min speed is theoretically 15 rpm, at some random pwm value we dont know yet.
+# min speed is theoretically 15 rpm, at some random pwm value we dont know yet.
 # Wheel tangential speed (m/s) that maps to |PWM| = 255
 PWM_REF_WHEEL_M_S = 1.778
 
@@ -52,19 +52,7 @@ class SpeedLimitDerived(NamedTuple):
     v_body_cap_m_s: float
     v_wheel_peak_m_s: float
     max_distance_allowed_m: float
-import sys
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray
-import sys
-import math
-import rclpy
-import serial
-from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
-from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray
-from typing import Iterable
+
 
 class TrackerSubscriber(Node):
     def __init__(self, args: argparse.Namespace):
@@ -100,7 +88,7 @@ class TrackerSubscriber(Node):
             '/bean_bag_trajectory',
             self.listener_callback,
             10,
-            callback_group=self.callback_group # Assign to group
+            callback_group=self.callback_group,
         )
 
     def _comm_print(self, phase: str, **kwargs: object) -> None:
@@ -186,7 +174,7 @@ class TrackerSubscriber(Node):
                 drive_block_ms=f"{(time.monotonic() - t_drive) * 1000.0:.3f}",
             )
             if self.args.stop_after > 0 and any(pwms):
-                 self.get_logger().info(f"Sent command; stop scheduled in {self.args.stop_after}s")
+                self.get_logger().info(f"Sent command; stop scheduled in {self.args.stop_after}s")
 
         # LOGGING: See if commands are actually being sent
         self.get_logger().debug(f"Sending PWM: {pwms}")
@@ -197,12 +185,12 @@ class TrackerSubscriber(Node):
         # Reset the stop timer
         if self.stop_timer:
             self.stop_timer.cancel()
-        
+
         # Create timer in the reentrant group
         self.stop_timer = self.create_timer(
-            self.args.stop_after, 
+            self.args.stop_after,
             self.timer_stop_callback,
-            callback_group=self.callback_group
+            callback_group=self.callback_group,
         )
 
     def stop_motors_and_close(self):
@@ -210,6 +198,7 @@ class TrackerSubscriber(Node):
             send_motor_stop(self.ser)
             self.ser.close()
             self.get_logger().info("Serial port closed.")
+
     def timer_stop_callback(self):
         self.get_logger().info("!!! TIMER STOP TRIGGERED !!!")
         self._comm_print("timer_stop_callback")
@@ -266,31 +255,6 @@ def derive_speed_limit_metrics(
     return SpeedLimitDerived(v_axial_max, v_body_cap, v_wheel_peak, max_dist)
 
 
-def _print_speed_limit_banner(
-    m: SpeedLimitDerived,
-    speed_fraction: float,
-    dt_s: float,
-    *,
-    file=sys.stderr,
-) -> None:
-    pct = speed_fraction * 100.0
-    print(
-        f"  Speed limit: {pct:g}% of axial max body speed "
-        f"(v_axial_max ≈ {m.v_axial_max_m_s:g} m/s, +x ref)",
-        file=file,
-    )
-    print(
-        f"  Allowed body speed cap ≈ {m.v_body_cap_m_s:g} m/s; "
-        f"peak wheel tangential at axial cap ≈ {m.v_wheel_peak_m_s:g} m/s",
-        file=file,
-    )
-    print(
-        f"  Max |distance_m| over {dt_s:g} s: {m.max_distance_allowed_m:g} m "
-        "(larger inputs are rejected, no motion sent)",
-        file=file,
-    )
-
-
 def speed_from_distance(distance_m: float, dt_s: float = DT_S) -> float:
     return distance_m / dt_s
 
@@ -311,30 +275,10 @@ def wheel_linear_velocities(x_dot_m_s: float, y_dot_m_s: float, alpha_rad: float
     return vs
 
 
-def _clamp_pwm(v: int) -> int:
-    return max(PWM_MIN, min(PWM_MAX, v))
-
-
-def velocities_to_pwm(vs: Sequence[float], max_speed_ref_m_s: float = PWM_REF_WHEEL_M_S) -> List[int]:
-    if max_speed_ref_m_s <= 0:
-        return [0, 0, 0, 0]
-    out: List[int] = []
-    for v in vs:
-        out.append(_clamp_pwm(round(v / max_speed_ref_m_s * PWM_MAX)))
-    return out
-
-
-def apply_motor_perm(vs: Sequence[float], perm: Sequence[int] = MOTOR_PERM) -> List[float]:
-    return [vs[perm[k]] for k in range(4)]
-
-
 def format_line(pwms: Sequence[int]) -> str:
-    a, b, c, d = (int(x) for x in pwms)
-    return f"{a},{b},{c},{d}\n"
-
-
-def open_serial(port: str, baud: int = 115200, timeout: float = 1.0) -> serial.Serial:
-    return serial.Serial(port, baud, timeout=timeout)
+    """Formats PWM list into the string expected by the Arduino firmware."""
+    ordered = [pwms[MOTOR_PERM[i]] for i in range(4)]
+    return ",".join(map(str, ordered)) + "\n"
 
 
 def open_serial(port: str, baud: int) -> serial.Serial:
@@ -343,33 +287,32 @@ def open_serial(port: str, baud: int) -> serial.Serial:
     time.sleep(2)  # Wait for Arduino reset
     return ser
 
-def format_line(pwms: Iterable[int]) -> str:
-    """Formats PWM list into the string expected by the Arduino firmware."""
-    # Maps internal calculation order to physical MOTOR_PERM order
-    ordered = [pwms[MOTOR_PERM[i]] for i in range(4)]
-    return ",".join(map(str, ordered)) + "\n"
 
 def send_motor_stop(ser: serial.Serial):
     """Sends zero velocity to all motors."""
     ser.write(b"0,0,0,0\n")
 
+
 def _send_drive_line_delayed_stop(ser: serial.Serial, line: str, pwms: List[int], delay: float):
     """Sends the command and handles the stop-after timer."""
-    ser.write(line.encode('utf-8'))
+    ser.write(line.encode("utf-8"))
     if delay > 0 and any(pwms):
         time.sleep(delay)
         send_motor_stop(ser)
+
 
 def pwm_from_body_velocity(vx: float, vy: float, alpha_rad: float, pwm_ref_m_s: float) -> List[int]:
     """Converts x/y velocity to discrete PWM values [-255, 255]."""
     v_wheels = wheel_linear_velocities(vx, vy, alpha_rad)
     return [int((v / pwm_ref_m_s) * PWM_MAX) for v in v_wheels]
 
+
 def pwm_from_distance_heading(dist_m: float, heading_rad: float, alpha_rad: float, pwm_ref_m_s: float) -> List[int]:
     """Converts distance/heading to PWM via a 1s time horizon."""
     speed = speed_from_distance(dist_m, DT_S)
     vx, vy = body_velocity_from_speed_heading(speed, heading_rad)
     return pwm_from_body_velocity(vx, vy, alpha_rad, pwm_ref_m_s)
+
 
 def main(args=None):
     parser = argparse.ArgumentParser(description="Omni-wheel Serial Node")
@@ -380,7 +323,6 @@ def main(args=None):
     parser.add_argument("--alpha", type=float, default=ALPHA_RAD)
     parser.add_argument("--pwm-ref", type=float, default=PWM_REF_WHEEL_M_S)
     parser.add_argument("--stop-after", type=float, default=STOP_AFTER_COMMAND_S)
-    # Optional: ignore message heading and use this heading (degrees) for PWM instead.
     parser.add_argument(
         "--heading-deg",
         type=float,
@@ -393,15 +335,14 @@ def main(args=None):
         help="Print [COMMDBG_PY] seq=... timing lines to stderr (monotonic seq per node)",
     )
 
-    parsed_args, unknown = parser.parse_known_args()
+    parsed_args, _unknown = parser.parse_known_args()
 
     rclpy.init(args=args)
     node = TrackerSubscriber(parsed_args)
     executor = MultiThreadedExecutor()
     executor.add_node(node)
-    executor.spin()
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         node.get_logger().info("Shutting down...")
     finally:
@@ -409,5 +350,6 @@ def main(args=None):
         node.destroy_node()
         rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

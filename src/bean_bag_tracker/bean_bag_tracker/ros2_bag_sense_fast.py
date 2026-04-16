@@ -29,10 +29,13 @@ class BeanBagTracker(Node):
         self.declare_parameter('result_topic', '/bean_bag_trajectory')
         self.declare_parameter('reset_delay_sec', 10.0)
         self.declare_parameter('min_publish_interval_sec', 5.0)
-        # Max horizontal miss (m, Euclidean from hole) for publishing / motion; larger → no publish, keyboard still arms.
+        # Max miss (m): hypot(x_land, depth_land - z_hole); larger → no publish, keyboard still arms.
         self.declare_parameter('max_publish_distance_m', 0.5)
+        # Camera-frame y (m) at which t_land is solved: y(t_land) = y_hole_m (hole-at-origin → 0).
+        self.declare_parameter('y_hole_m', 0.0)
 
         self.hole_distance = self.get_parameter('hole_distance_inches').value * 0.0254  # convert to meters
+        self.y_hole_m = float(self.get_parameter('y_hole_m').value)
         self.min_publish_interval = float(self.get_parameter('min_publish_interval_sec').value)
         self.max_publish_distance_m = float(self.get_parameter('max_publish_distance_m').value)
 
@@ -46,8 +49,7 @@ class BeanBagTracker(Node):
         # State variables
         self.required_points = 3 
         self.state = 'IDLE'          # IDLE, COLLECTING, WAIT
-        self.points = []              # list of (timestamp, x, y, z) in meters
-        self.reset_timer = None
+        self.points = []              # list of (timestamp, x, y, depth) in meters
         # Use a Reentrant group so the timer and subscriber can run simultaneously
         self.callback_group = ReentrantCallbackGroup()
         # ROS communication
@@ -167,11 +169,6 @@ class BeanBagTracker(Node):
         self.state = 'IDLE'
         self.points.clear()
 
-    def reset_state(self):
-        """Re-enable image processing for the next throw."""
-        with self._state_lock:
-            self._apply_idle_reset()
-
     def find_red_centroid(self, bgr_image):
         """Detect the largest red blob and return its centroid (u, v) or None."""
         hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
@@ -206,12 +203,12 @@ class BeanBagTracker(Node):
         return (cx, cy)
 
     def _backtrack_sample_point_lines(self, t0: float) -> list[str]:
-        lines: list[str] = ['  samples (camera frame, hole at origin in board plane):']
-        for i, (t_abs, xi, yi, zi) in enumerate(self.points):
+        lines: list[str] = ['  samples (t, x, y_cam, depth_m):']
+        for i, (t_abs, xi, yi, di) in enumerate(self.points):
             tr = t_abs - t0
             lines.append(
                 f'    pt[{i}] t_ros={t_abs:.6f}s  t_rel={tr:.6f}s  '
-                f'x={xi:.6f}m  y={yi:.6f}m  z={zi:.6f}m'
+                f'x={xi:.6f}m  y_cam={yi:.6f}m  depth={di:.6f}m'
             )
         return lines
 
@@ -221,6 +218,9 @@ class BeanBagTracker(Node):
 
     def compute_and_publish(self) -> tuple[bool, bool]:
         """Fit trajectory, predict landing. Returns (published, arm_keyboard).
+
+        Linear fits on t_rel: x, y_cam (for t_land via y_cam=y_hole_m), depth.
+        Miss: hypot(x_land, depth_land - z_hole); angle atan2(d_depth, x_land).
 
         ``published`` is True only if a message was sent. ``arm_keyboard`` is True
         to enter WAIT + stdin (all finished cycles except compute aborted on cooldown).
@@ -243,62 +243,64 @@ class BeanBagTracker(Node):
         times = np.array([p[0] - t0 for p in self.points])
         xs = np.array([p[1] for p in self.points])
         ys = np.array([p[2] for p in self.points])
-        zs = np.array([p[3] for p in self.points])
+        depths = np.array([p[3] for p in self.points])
 
         coeffs_x = np.polyfit(times, xs, 1)   # [vx, x0]  => x(t)=vx*t+x0
-        coeffs_z = np.polyfit(times, zs, 1)   # [vz, z0]  => z(t)=vz*t+z0
-        coeffs_y = np.polyfit(times, ys, 2)   # [a/2, vy, y0] => y(t)=(a/2)*t^2+vy*t+y0
+        coeffs_y_lin = np.polyfit(times, ys, 1)   # [vy, y0]  => y_cam(t)=vy*t+y0  (time solve)
+        coeffs_depth = np.polyfit(times, depths, 1)   # [vd, d0]  => depth(t)=vd*t+d0
 
         vx, x0 = coeffs_x
-        vz, z0 = coeffs_z
-        a_half, vy, y0 = coeffs_y
+        vy, y0 = coeffs_y_lin
+        vd, d0 = coeffs_depth
 
         zh = float(self.hole_distance)
+        y_hole = float(self.y_hole_m)
         lines = [
             '--- bag distance backtrack ---',
         ]
         lines.extend(self._backtrack_sample_point_lines(t0))
         lines.append(
             f'  polyfit (t_rel from first sample): '
-            f'x(t)={vx:.6f}*t+{x0:.6f}  z(t)={vz:.6f}*t+{z0:.6f}  '
-            f'y(t)={a_half:.6f}*t^2+{vy:.6f}*t+{y0:.6f}'
+            f'x(t)={vx:.6f}*t+{x0:.6f}  y_cam(t)={vy:.6f}*t+{y0:.6f}  '
+            f'depth(t)={vd:.6f}*t+{d0:.6f}'
         )
         lines.append(
-            f'  backtrack z to hole plane: z(t_land)=z_hole={zh:.6f}m  '
-            f'=> vz*t_land+z0=zh  => t_land=(zh-z0)/vz'
+            f'  t_land from y_cam(t_land)=y_hole: y_hole={y_hole:.6f}m  '
+            f'=> vy*t_land+y0=y_hole  => t_land=(y_hole-y0)/vy'
         )
 
-        if abs(vz) < 1e-6:
-            lines.append(f'  vz={vz:.6e}  => |vz|<1e-6, t_land undefined (division by zero)')
-            lines.append('  outcome: vz_near_zero (no /bean_bag_trajectory publish)')
+        if abs(vy) < 1e-6:
+            lines.append(f'  vy={vy:.6e}  => |vy|<1e-6, t_land undefined (division by zero)')
+            lines.append('  outcome: vy_near_zero (no /bean_bag_trajectory publish)')
             self._emit_bag_distance_backtrack(lines)
             return (False, True)
 
-        t_land = (zh - z0) / vz
+        t_land = (y_hole - y0) / vy
         x_land = vx * t_land + x0
-        y_land = a_half * t_land**2 + vy * t_land + y0
+        depth_land = vd * t_land + d0
         dx = x_land
-        dy = y_land
-        distance_m = math.hypot(dx, dy)
-        angle = math.atan2(dy, dx)
+        d_depth = depth_land - zh
+        distance_m = math.hypot(dx, d_depth)
+        angle = math.atan2(d_depth, dx)
 
         lines.append(
-            f'  t_land = (zh-z0)/vz = ({zh:.6f}-{z0:.6f})/{vz:.6f} = {t_land:.6f} s'
+            f'  t_land = (y_hole-y0)/vy = ({y_hole:.6f}-{y0:.6f})/{vy:.6f} = {t_land:.6f} s'
         )
         lines.append(
             f'  x_land = vx*t_land+x0 = {vx:.6f}*{t_land:.6f}+{x0:.6f} = {x_land:.6f} m'
         )
         lines.append(
-            f'  y_land = (a/2)*t_land^2+vy*t_land+y0 = '
-            f'{a_half:.6f}*{t_land:.6f}^2+{vy:.6f}*{t_land:.6f}+{y0:.6f} = {y_land:.6f} m'
+            f'  depth_land = vd*t_land+d0 = {vd:.6f}*{t_land:.6f}+{d0:.6f} = {depth_land:.6f} m'
+        )
+        lines.append(f'  z_hole (range ref, m) = {zh:.6f}  => d_depth = depth_land - z_hole = {d_depth:.6f} m')
+        lines.append(
+            f'  miss: dx=x_land={dx:.6f} m, d_depth={d_depth:.6f} m  '
+            f'(angle_rad=atan2(d_depth,dx))'
         )
         lines.append(
-            f'  miss from hole (origin): dx=x_land={dx:.6f} m, dy=y_land={dy:.6f} m'
+            f'  distance_m = hypot(dx,d_depth) = sqrt({dx:.6f}^2+{d_depth:.6f}^2) = {distance_m:.6f} m'
         )
-        lines.append(
-            f'  distance_m = hypot(dx,dy) = sqrt({dx:.6f}^2+{dy:.6f}^2) = {distance_m:.6f} m'
-        )
-        lines.append(f'  angle_rad = atan2(dy,dx) = {angle:.6f}')
+        lines.append(f'  angle_rad = atan2(d_depth,dx) = {angle:.6f}')
         lines.append(f'  max_publish_distance_m = {self.max_publish_distance_m:.6f}')
 
         topic = self.get_parameter('result_topic').value
@@ -321,14 +323,6 @@ class BeanBagTracker(Node):
         self._emit_bag_distance_backtrack(lines)
 
         return (True, True)
-
-    def reset(self):
-        """Reset after 10s wait period."""
-        if self.reset_timer is not None:
-            self.reset_timer.cancel()
-            self.reset_timer = None
-        with self._state_lock:
-            self._apply_idle_reset()
 
 def main(args=None):
     rclpy.init(args=args)
