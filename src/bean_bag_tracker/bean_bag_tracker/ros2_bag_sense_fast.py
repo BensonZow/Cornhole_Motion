@@ -197,16 +197,18 @@ class BeanBagTracker(Node):
     def _red_binary_mask_bgr(self, bgr: np.ndarray) -> np.ndarray:
         """HSV red mask (8-bit) after morphology; same semantics as find_red_centroid pre-contours."""
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        lower_red1 = np.array([0, 100, 100])
-        upper_red1 = np.array([10, 255, 255])
-        lower_red2 = np.array([160, 100, 100])
+        # Wider hue + lower S/V floors so pale, dark, and varied reds pass;
+        # 3x3 morphology is gentler than 5x5 (less erosion of thin regions).
+        lower_red1 = np.array([0, 55, 55])
+        upper_red1 = np.array([12, 255, 255])
+        lower_red2 = np.array([168, 55, 55])
         upper_red2 = np.array([180, 255, 255])
 
         mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
         mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
         mask = cv2.bitwise_or(mask1, mask2)
 
-        kernel = np.ones((5, 5), np.uint8)
+        kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         return mask
