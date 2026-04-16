@@ -19,10 +19,10 @@ from rclpy.time import Time
 # 3D trajectory debug PNGs (matplotlib Agg).
 TRAJECTORY_DEBUG_PLOT_DIR = '/home/cornholio/ros2_jazzy/log'
 
-# Dark purple HSV tuning (OpenCV BGR→HSV: H 0–179, S and V 0–255).
-# Hue 130–160: violet/purple. S 80+ avoids muted gray. V 30–150 keeps dark purple, not bright lavender.
-PURPLE_HSV_LOWER = (130, 80, 30)
-PURPLE_HSV_UPPER = (160, 255, 150)
+# Purple HSV tuning (OpenCV BGR→HSV: H 0–179, S and V 0–255). Lenient band for varied lighting / saturation.
+# Wider hue (violet–blue-magenta edge), lower S floor (dusty purples), wider V (shadow + slightly brighter).
+PURPLE_HSV_LOWER = (122, 45, 15)
+PURPLE_HSV_UPPER = (168, 255, 210)
 # Square kernel edge length for open/close (e.g. 3 = gentler than 5).
 PURPLE_MASK_MORPH_KERNEL_SIZE = 3
 
