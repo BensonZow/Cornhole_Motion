@@ -7,7 +7,10 @@
   <maintainer email="cornholio@todo.todo">cornholio</maintainer>
   <license>Apache-2.0</license>
 
+  <exec_depend>arduino_serial_com</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
   <exec_depend>python3-matplotlib</exec_depend>
+  <exec_depend>realsense2_camera</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
