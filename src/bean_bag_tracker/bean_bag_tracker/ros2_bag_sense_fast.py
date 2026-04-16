@@ -120,7 +120,7 @@ class BeanBagTracker(Node):
             return
 
         color_image = self.bridge.imgmsg_to_cv2(color_msg, 'bgr8')
-        centroid = self.find_red_centroid(color_image)
+        centroid = self.find_yellow_centroid(color_image)
 
         if centroid is None:
             return
@@ -194,32 +194,26 @@ class BeanBagTracker(Node):
         self.points.clear()
         self._debug_first_frame_bgr = None
 
-    def _red_binary_mask_bgr(self, bgr: np.ndarray) -> np.ndarray:
-        """HSV red mask (8-bit) after morphology; same semantics as find_red_centroid pre-contours."""
+    def _yellow_binary_mask_bgr(self, bgr: np.ndarray) -> np.ndarray:
+        """HSV yellow mask (8-bit) after morphology; same semantics as find_yellow_centroid pre-contours."""
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        # Wider hue + lower S/V floors so pale, dark, and varied reds pass;
-        # 3x3 morphology is gentler than 5x5 (less erosion of thin regions).
-        lower_red1 = np.array([0, 55, 55])
-        upper_red1 = np.array([12, 255, 255])
-        lower_red2 = np.array([168, 55, 55])
-        upper_red2 = np.array([180, 255, 255])
-
-        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-        mask = cv2.bitwise_or(mask1, mask2)
+        # Yellow ~ hue 18–40 (OpenCV H 0–179); relaxed S/V; keep below typical green (~45+).
+        lower = np.array([18, 55, 55])
+        upper = np.array([40, 255, 255])
+        mask = cv2.inRange(hsv, lower, upper)
 
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         return mask
 
-    def _red_masked_bgr(self, bgr: np.ndarray) -> np.ndarray:
-        mask = self._red_binary_mask_bgr(bgr)
+    def _yellow_masked_bgr(self, bgr: np.ndarray) -> np.ndarray:
+        mask = self._yellow_binary_mask_bgr(bgr)
         return cv2.bitwise_and(bgr, bgr, mask=mask)
 
-    def find_red_centroid(self, bgr_image):
-        """Detect the largest red blob and return its centroid (u, v) or None."""
-        mask = self._red_binary_mask_bgr(bgr_image)
+    def find_yellow_centroid(self, bgr_image):
+        """Detect the largest yellow blob and return its centroid (u, v) or None."""
+        mask = self._yellow_binary_mask_bgr(bgr_image)
 
         # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -279,7 +273,7 @@ class BeanBagTracker(Node):
         zh: float,
         first_bgr: np.ndarray | None,
     ) -> None:
-        """Save dual-tile PNG: 3D trajectory (mpl X=x, Y=depth, Z=y_cam) + optional red-mask frame."""
+        """Save dual-tile PNG: 3D trajectory (mpl X=x, Y=depth, Z=y_cam) + optional yellow-mask frame."""
         try:
             import matplotlib
 
@@ -372,9 +366,9 @@ class BeanBagTracker(Node):
 
         ax_img = fig.add_subplot(1, 2, 2)
         if first_bgr is not None:
-            rgb = cv2.cvtColor(self._red_masked_bgr(first_bgr), cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(self._yellow_masked_bgr(first_bgr), cv2.COLOR_BGR2RGB)
             ax_img.imshow(rgb)
-            ax_img.set_title('Frame 1 (red mask)')
+            ax_img.set_title('Frame 1 (yellow mask)')
             ax_img.axis('off')
         else:
             ax_img.text(0.5, 0.5, 'no frame captured', ha='center', va='center', transform=ax_img.transAxes)
