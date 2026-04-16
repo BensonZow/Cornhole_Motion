@@ -19,16 +19,13 @@ from rclpy.time import Time
 # 3D trajectory debug PNGs (matplotlib Agg).
 TRAJECTORY_DEBUG_PLOT_DIR = '/home/cornholio/ros2_jazzy/log'
 
-# Red HSV tuning (OpenCV BGR→HSV: H 0–179, S and V 0–255). Hue wraps at 0° → two ranges.
-# Lenient S/V: lower S floor, wider V for shadow / highlights.
-RED_HSV_1_LOWER = (0, 45, 15)
-RED_HSV_1_UPPER = (15, 255, 210)
-RED_HSV_2_LOWER = (165, 45, 15)
-RED_HSV_2_UPPER = (180, 255, 210)
+# Purple HSV tuning (OpenCV BGR→HSV: H 0–179, S and V 0–255). Lenient band for varied lighting / saturation.
+PURPLE_HSV_LOWER = (122, 45, 15)
+PURPLE_HSV_UPPER = (168, 255, 210)
 # Square kernel edge length for open/close (e.g. 3 = gentler than 5).
-RED_MASK_MORPH_KERNEL_SIZE = 3
-# Ignore detection when the red mask has this many pixels or fewer (noise guard).
-RED_MASK_MAX_PIXELS_TO_IGNORE = 100
+PURPLE_MASK_MORPH_KERNEL_SIZE = 3
+# Ignore detection when the purple mask has this many pixels or fewer (noise guard).
+PURPLE_MASK_MAX_PIXELS_TO_IGNORE = 100
 
 
 def _wait_for_confirm_y_line() -> None:
@@ -131,7 +128,7 @@ class BeanBagTracker(Node):
             return
 
         color_image = self.bridge.imgmsg_to_cv2(color_msg, 'bgr8')
-        centroid = self.find_red_centroid(color_image)
+        centroid = self.find_purple_centroid(color_image)
 
         if centroid is None:
             return
@@ -205,32 +202,27 @@ class BeanBagTracker(Node):
         self.points.clear()
         self._debug_first_frame_bgr = None
 
-    def _red_binary_mask_bgr(self, bgr: np.ndarray) -> np.ndarray:
-        """HSV red mask (8-bit) after morphology; same semantics as find_red_centroid pre-contours."""
+    def _purple_binary_mask_bgr(self, bgr: np.ndarray) -> np.ndarray:
+        """HSV purple mask (8-bit) after morphology; same semantics as find_purple_centroid pre-contours."""
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        lower1 = np.array(RED_HSV_1_LOWER, dtype=np.uint8)
-        upper1 = np.array(RED_HSV_1_UPPER, dtype=np.uint8)
-        lower2 = np.array(RED_HSV_2_LOWER, dtype=np.uint8)
-        upper2 = np.array(RED_HSV_2_UPPER, dtype=np.uint8)
+        lower = np.array(PURPLE_HSV_LOWER, dtype=np.uint8)
+        upper = np.array(PURPLE_HSV_UPPER, dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower, upper)
 
-        mask1 = cv2.inRange(hsv, lower1, upper1)
-        mask2 = cv2.inRange(hsv, lower2, upper2)
-        mask = cv2.bitwise_or(mask1, mask2)
-
-        k = max(1, int(RED_MASK_MORPH_KERNEL_SIZE))
+        k = max(1, int(PURPLE_MASK_MORPH_KERNEL_SIZE))
         kernel = np.ones((k, k), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         return mask
 
-    def _red_masked_bgr(self, bgr: np.ndarray) -> np.ndarray:
-        mask = self._red_binary_mask_bgr(bgr)
+    def _purple_masked_bgr(self, bgr: np.ndarray) -> np.ndarray:
+        mask = self._purple_binary_mask_bgr(bgr)
         return cv2.bitwise_and(bgr, bgr, mask=mask)
 
-    def find_red_centroid(self, bgr_image):
-        """Detect the largest red blob and return its centroid (u, v) or None."""
-        mask = self._red_binary_mask_bgr(bgr_image)
-        if int(cv2.countNonZero(mask)) <= RED_MASK_MAX_PIXELS_TO_IGNORE:
+    def find_purple_centroid(self, bgr_image):
+        """Detect the largest purple blob and return its centroid (u, v) or None."""
+        mask = self._purple_binary_mask_bgr(bgr_image)
+        if int(cv2.countNonZero(mask)) <= PURPLE_MASK_MAX_PIXELS_TO_IGNORE:
             return None
 
         # Find contours
@@ -291,7 +283,7 @@ class BeanBagTracker(Node):
         zh: float,
         first_bgr: np.ndarray | None,
     ) -> None:
-        """Save dual-tile PNG: 3D trajectory (mpl X=x, Y=depth, Z=y_cam) + optional red-mask frame."""
+        """Save dual-tile PNG: 3D trajectory (mpl X=x, Y=depth, Z=y_cam) + optional purple-mask frame."""
         try:
             import matplotlib
 
@@ -384,9 +376,9 @@ class BeanBagTracker(Node):
 
         ax_img = fig.add_subplot(1, 2, 2)
         if first_bgr is not None:
-            rgb = cv2.cvtColor(self._red_masked_bgr(first_bgr), cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(self._purple_masked_bgr(first_bgr), cv2.COLOR_BGR2RGB)
             ax_img.imshow(rgb)
-            ax_img.set_title('Frame 1 (red mask)')
+            ax_img.set_title('Frame 1 (purple mask)')
             ax_img.axis('off')
         else:
             ax_img.text(0.5, 0.5, 'no frame captured', ha='center', va='center', transform=ax_img.transAxes)
