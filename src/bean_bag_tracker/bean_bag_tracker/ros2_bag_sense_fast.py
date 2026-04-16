@@ -16,6 +16,24 @@ from rclpy.node import Node
 from rclpy.time import Time
 
 
+def _wait_for_confirm_y_line() -> None:
+    """Block until the user types ``y`` and ends the line (Enter / Return).
+
+    Uses line-oriented ``input()`` so the same behavior applies on Windows
+    (CRLF), macOS, and Linux (LF). Empty lines and other text are ignored until
+    a line whose stripped value is ``y`` (case-insensitive).
+    """
+    sys.stdout.write('Type y then press Enter when ready for the next bag...\n')
+    sys.stdout.flush()
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            return
+        if line.strip().casefold() == 'y':
+            return
+
+
 class BeanBagTracker(Node):
     def __init__(self):
         super().__init__('bean_bag_tracker')
@@ -137,17 +155,12 @@ class BeanBagTracker(Node):
                         self.state = 'IDLE'
 
     def _spawn_stdin_arm_thread(self) -> None:
-        """Wait for Enter (TTY stdin), then remaining publish cooldown; arm IDLE via poll timer."""
+        """Wait for a ``y`` line on stdin, then remaining publish cooldown; arm IDLE via poll timer."""
         min_interval = self.min_publish_interval
 
         def worker() -> None:
-            try:
-                # Requires a TTY when launched with `ros2 run` in a terminal.
-                sys.stdout.write('Press Enter when ready for the next bag...\n')
-                sys.stdout.flush()
-                input()
-            except EOFError:
-                pass
+            # Requires a TTY when launched with `ros2 run` in a terminal.
+            _wait_for_confirm_y_line()
             rem = max(0.0, min_interval - (time.monotonic() - self._last_publish_mono))
             if rem > 0:
                 time.sleep(rem)
