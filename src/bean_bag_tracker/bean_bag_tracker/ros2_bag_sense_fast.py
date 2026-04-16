@@ -19,13 +19,28 @@ from rclpy.time import Time
 # 3D trajectory debug PNGs (matplotlib Agg).
 TRAJECTORY_DEBUG_PLOT_DIR = '/home/cornholio/ros2_jazzy/log'
 
-# Purple HSV tuning (OpenCV BGR→HSV: H 0–179, S and V 0–255). Lenient band for varied lighting / saturation.
-PURPLE_HSV_LOWER = (122, 45, 15)
-PURPLE_HSV_UPPER = (168, 255, 210)
+# Purple HSV tuning (OpenCV BGR→HSV: H 0–179, S and V 0–255). Slightly wider for lighter / pastel purples.
+PURPLE_HSV_LOWER = (118, 35, 15)
+PURPLE_HSV_UPPER = (172, 255, 245)
 # Square kernel edge length for open/close (e.g. 3 = gentler than 5).
 PURPLE_MASK_MORPH_KERNEL_SIZE = 3
 # Ignore detection when the purple mask has this many pixels or fewer (noise guard).
 PURPLE_MASK_MAX_PIXELS_TO_IGNORE = 100
+
+
+def purple_hsv_reference_gradient_bgr() -> np.ndarray:
+    """BGR strip for debug PNG: H increases left→right, V increases top→bottom, S fixed at band mid."""
+    h_lo, s_lo, v_lo = PURPLE_HSV_LOWER
+    h_hi, s_hi, v_hi = PURPLE_HSV_UPPER
+    nh, nw = 120, 360
+    h_vec = np.clip(np.linspace(float(h_lo), float(h_hi), nw), 0.0, 179.0).astype(np.uint8)
+    v_vec = np.clip(np.linspace(float(v_lo), float(v_hi), nh), 0.0, 255.0).astype(np.uint8)
+    h_mat = np.tile(h_vec, (nh, 1))
+    v_mat = np.tile(v_vec.reshape(-1, 1), (1, nw))
+    s_mid = int(np.clip((int(s_lo) + int(s_hi)) // 2, 0, 255))
+    s_mat = np.full((nh, nw), s_mid, dtype=np.uint8)
+    hsv = np.stack([h_mat, s_mat, v_mat], axis=-1)
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
 
 def _wait_for_confirm_y_line() -> None:
@@ -78,7 +93,7 @@ class BeanBagTracker(Node):
         # State variables
         self.required_points = 3 
         self.state = 'IDLE'          # IDLE, COLLECTING, WAIT
-        self.points = []              # list of (timestamp, x, y, depth) in meters
+        self.points = []  # (t, x, y, depth_m, u_px, v_px) — u,v = purple blob centroid that frame
         self._debug_first_frame_bgr: np.ndarray | None = None
         # Use a Reentrant group so the timer and subscriber can run simultaneously
         self.callback_group = ReentrantCallbackGroup()
@@ -153,13 +168,13 @@ class BeanBagTracker(Node):
                 elapsed = time.monotonic() - self._last_publish_mono
                 if elapsed < self.min_publish_interval:
                     return
-                self.points = [(t, x, y, depth)]
+                self.points = [(t, x, y, depth, u, v)]
                 self.state = 'COLLECTING'
                 self._debug_first_frame_bgr = color_image.copy()
 
             # Add subsequent points
             elif self.state == 'COLLECTING':
-                self.points.append((t, x, y, depth))
+                self.points.append((t, x, y, depth, u, v))
 
                 # TRIGGER: Once we hit 3, calculate and SHUT DOWN processing
                 if len(self.points) >= self.required_points:
@@ -240,6 +255,17 @@ class BeanBagTracker(Node):
         cy = int(M['m01'] / M['m00'])
         return (cx, cy)
 
+    @staticmethod
+    def _xy_depth_to_uv(
+        x: float, y: float, depth: float, fx: float, fy: float, cx: float, cy: float
+    ) -> tuple[int, int] | None:
+        """Pinhole inverse of ``x=(u-cx)*d/fx`` → pixel (u, v) for overlay on the color frame."""
+        if depth <= 1e-9:
+            return None
+        u = int(round(float(x) * float(fx) / float(depth) + float(cx)))
+        v = int(round(float(y) * float(fy) / float(depth) + float(cy)))
+        return (u, v)
+
     def _backtrack_depth_scale_line(self) -> str:
         return (
             f'  Depth scale is: {self.depth_scale} m/raw_unit  '
@@ -251,11 +277,11 @@ class BeanBagTracker(Node):
             self._backtrack_depth_scale_line(),
             '  samples (t, x, y_cam, depth_m from uint16 * depth_scale):',
         ]
-        for i, (t_abs, xi, yi, di) in enumerate(self.points):
+        for i, (t_abs, xi, yi, di, ui, vi) in enumerate(self.points):
             tr = t_abs - t0
             lines.append(
                 f'    pt[{i}] t_ros={t_abs:.6f}s  t_rel={tr:.6f}s  '
-                f'x={xi:.6f}m  y_cam={yi:.6f}m  depth={di:.6f}m'
+                f'x={xi:.6f}m  y_cam={yi:.6f}m  depth={di:.6f}m  blob_uv=({ui},{vi})'
             )
         return lines
 
@@ -282,8 +308,14 @@ class BeanBagTracker(Node):
         depth_land: float | None,
         zh: float,
         first_bgr: np.ndarray | None,
+        blob_us: np.ndarray,
+        blob_vs: np.ndarray,
+        fx: float | None,
+        fy: float | None,
+        cx: float | None,
+        cy: float | None,
     ) -> None:
-        """Save dual-tile PNG: 3D trajectory (mpl X=x, Y=depth, Z=y_cam) + optional purple-mask frame."""
+        """Save 1×3 PNG: 3D trajectory, frame-1 mask with pt1 overlays only, HSV purple strip."""
         try:
             import matplotlib
 
@@ -303,9 +335,11 @@ class BeanBagTracker(Node):
         xs_c = np.asarray(xs, dtype=float).copy()
         ys_c = np.asarray(ys, dtype=float).copy()
         depths_c = np.asarray(depths, dtype=float).copy()
+        bu = np.asarray(blob_us, dtype=int).ravel()
+        bv = np.asarray(blob_vs, dtype=int).ravel()
 
-        fig = plt.figure(figsize=(14, 6))
-        ax = fig.add_subplot(1, 2, 1, projection='3d')
+        fig = plt.figure(figsize=(20, 6))
+        ax = fig.add_subplot(1, 3, 1, projection='3d')
 
         ax.scatter([0.0], [0.0], [0.0], c='k', s=80, marker='^', label='camera')
         ax.plot(xs_c, depths_c, ys_c, 'b-', alpha=0.5, linewidth=1)
@@ -374,15 +408,60 @@ class BeanBagTracker(Node):
         ax.set_title('Trajectory (camera frame: floor x–depth, up y_cam)')
         ax.legend(loc='upper left', fontsize=8)
 
-        ax_img = fig.add_subplot(1, 2, 2)
+        ax_img = fig.add_subplot(1, 3, 2)
         if first_bgr is not None:
-            rgb = cv2.cvtColor(self._purple_masked_bgr(first_bgr), cv2.COLOR_BGR2RGB)
+            vis_bgr = self._purple_masked_bgr(first_bgr).copy()
+            h_img, w_img = vis_bgr.shape[:2]
+            rad = max(6, min(w_img, h_img) // 80)
+            # Middle panel is frame 1 only: overlay pt1 (earliest sample) reprojection + blob centroid.
+            if fx is not None and fy is not None and cx is not None and cy is not None and len(xs_c) > 0:
+                uv = self._xy_depth_to_uv(
+                    float(xs_c[0]),
+                    float(ys_c[0]),
+                    float(depths_c[0]),
+                    float(fx),
+                    float(fy),
+                    float(cx),
+                    float(cy),
+                )
+                if uv is not None:
+                    u, v = uv
+                    if 0 <= u < w_img and 0 <= v < h_img:
+                        ring_bgr = (0, 165, 255)
+                        cv2.circle(vis_bgr, (u, v), rad, ring_bgr, 2)
+                        cv2.circle(vis_bgr, (u, v), 2, (255, 255, 255), -1)
+                        cv2.putText(
+                            vis_bgr,
+                            'pt1 3D',
+                            (min(u + 6, w_img - 56), max(v - 6, 12)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (255, 255, 255),
+                            1,
+                            cv2.LINE_AA,
+                        )
+            if len(bu) > 0 and len(bv) > 0:
+                blob_r = max(3, min(w_img, h_img) // 120)
+                cyan_bgr = (255, 255, 0)
+                ub, vb = int(bu[0]), int(bv[0])
+                if 0 <= ub < w_img and 0 <= vb < h_img:
+                    cv2.circle(vis_bgr, (ub, vb), blob_r, cyan_bgr, -1, lineType=cv2.LINE_AA)
+                    cv2.circle(vis_bgr, (ub, vb), 1, (40, 40, 40), -1, lineType=cv2.LINE_AA)
+            rgb = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
             ax_img.imshow(rgb)
-            ax_img.set_title('Frame 1 (purple mask)')
+            ax_img.set_title('Frame 1 only (pt1: mask + blob cyan + 3D reproject ring)')
             ax_img.axis('off')
         else:
             ax_img.text(0.5, 0.5, 'no frame captured', ha='center', va='center', transform=ax_img.transAxes)
             ax_img.axis('off')
+
+        ax_grad = fig.add_subplot(1, 3, 3)
+        grad_bgr = purple_hsv_reference_gradient_bgr()
+        ax_grad.imshow(cv2.cvtColor(grad_bgr, cv2.COLOR_BGR2RGB))
+        ax_grad.set_title('Purple HSV band (H→, V↓, S=mid)')
+        ax_grad.set_xlabel('hue (low → high)')
+        ax_grad.set_ylabel('value (low → high)')
+        ax_grad.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
 
         fig.text(0.02, 0.02, f'z_hole (range ref) = {zh:.4f} m', fontsize=8)
         fig.tight_layout()
@@ -433,6 +512,8 @@ class BeanBagTracker(Node):
         xs = np.array([p[1] for p in self.points])
         ys = np.array([p[2] for p in self.points])
         depths = np.array([p[3] for p in self.points])
+        blob_us = np.array([p[4] for p in self.points], dtype=int)
+        blob_vs = np.array([p[5] for p in self.points], dtype=int)
 
         coeffs_x = np.polyfit(times, xs, 1)
         coeffs_y = np.polyfit(times, ys, 2)
@@ -479,6 +560,12 @@ class BeanBagTracker(Node):
                 depth_land=None,
                 zh=zh,
                 first_bgr=first_bgr,
+                blob_us=blob_us,
+                blob_vs=blob_vs,
+                fx=self.fx,
+                fy=self.fy,
+                cx=self.cx,
+                cy=self.cy,
             )
             return (False, True)
 
@@ -539,6 +626,12 @@ class BeanBagTracker(Node):
                 depth_land=depth_land,
                 zh=zh,
                 first_bgr=first_bgr,
+                blob_us=blob_us,
+                blob_vs=blob_vs,
+                fx=self.fx,
+                fy=self.fy,
+                cx=self.cx,
+                cy=self.cy,
             )
             return (False, True)
 
@@ -568,6 +661,12 @@ class BeanBagTracker(Node):
             depth_land=depth_land,
             zh=zh,
             first_bgr=first_bgr,
+            blob_us=blob_us,
+            blob_vs=blob_vs,
+            fx=self.fx,
+            fy=self.fy,
+            cx=self.cx,
+            cy=self.cy,
         )
 
         return (True, True)
