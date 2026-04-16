@@ -26,7 +26,7 @@ PURPLE_HSV_UPPER = (168, 255, 210)
 # Square kernel edge length for open/close (e.g. 3 = gentler than 5).
 PURPLE_MASK_MORPH_KERNEL_SIZE = 3
 # Ignore detection when the purple mask has this many pixels or fewer (noise guard).
-PURPLE_MASK_MAX_PIXELS_TO_IGNORE = 5
+PURPLE_MASK_MAX_PIXELS_TO_IGNORE = 100
 
 
 def _wait_for_confirm_y_line() -> None:
