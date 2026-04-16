@@ -25,6 +25,8 @@ PURPLE_HSV_LOWER = (122, 45, 15)
 PURPLE_HSV_UPPER = (168, 255, 210)
 # Square kernel edge length for open/close (e.g. 3 = gentler than 5).
 PURPLE_MASK_MORPH_KERNEL_SIZE = 3
+# Ignore detection when the purple mask has this many pixels or fewer (noise guard).
+PURPLE_MASK_MAX_PIXELS_TO_IGNORE = 5
 
 
 def _wait_for_confirm_y_line() -> None:
@@ -221,6 +223,8 @@ class BeanBagTracker(Node):
     def find_purple_centroid(self, bgr_image):
         """Detect the largest purple blob and return its centroid (u, v) or None."""
         mask = self._purple_binary_mask_bgr(bgr_image)
+        if int(cv2.countNonZero(mask)) <= PURPLE_MASK_MAX_PIXELS_TO_IGNORE:
+            return None
 
         # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
