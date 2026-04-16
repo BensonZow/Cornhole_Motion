@@ -71,6 +71,7 @@ class BeanBagTracker(Node):
         self.required_points = 3 
         self.state = 'IDLE'          # IDLE, COLLECTING, WAIT
         self.points = []              # list of (timestamp, x, y, depth) in meters
+        self._debug_first_frame_bgr: np.ndarray | None = None
         # Use a Reentrant group so the timer and subscriber can run simultaneously
         self.callback_group = ReentrantCallbackGroup()
         # ROS communication
@@ -146,6 +147,7 @@ class BeanBagTracker(Node):
                     return
                 self.points = [(t, x, y, depth)]
                 self.state = 'COLLECTING'
+                self._debug_first_frame_bgr = color_image.copy()
 
             # Add subsequent points
             elif self.state == 'COLLECTING':
@@ -161,6 +163,7 @@ class BeanBagTracker(Node):
                     else:
                         self.points.clear()
                         self.state = 'IDLE'
+                        self._debug_first_frame_bgr = None
 
     def _spawn_stdin_arm_thread(self) -> None:
         """Wait for a ``y`` line on stdin, then remaining publish cooldown; arm IDLE via poll timer."""
@@ -189,11 +192,11 @@ class BeanBagTracker(Node):
         self._pending_keyboard_reset = False
         self.state = 'IDLE'
         self.points.clear()
+        self._debug_first_frame_bgr = None
 
-    def find_red_centroid(self, bgr_image):
-        """Detect the largest red blob and return its centroid (u, v) or None."""
-        hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
-        # Red has two hue ranges
+    def _red_binary_mask_bgr(self, bgr: np.ndarray) -> np.ndarray:
+        """HSV red mask (8-bit) after morphology; same semantics as find_red_centroid pre-contours."""
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         lower_red1 = np.array([0, 100, 100])
         upper_red1 = np.array([10, 255, 255])
         lower_red2 = np.array([160, 100, 100])
@@ -203,10 +206,18 @@ class BeanBagTracker(Node):
         mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
         mask = cv2.bitwise_or(mask1, mask2)
 
-        # Optional: morphological ops to clean mask
-        kernel = np.ones((5,5), np.uint8)
+        kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        return mask
+
+    def _red_masked_bgr(self, bgr: np.ndarray) -> np.ndarray:
+        mask = self._red_binary_mask_bgr(bgr)
+        return cv2.bitwise_and(bgr, bgr, mask=mask)
+
+    def find_red_centroid(self, bgr_image):
+        """Detect the largest red blob and return its centroid (u, v) or None."""
+        mask = self._red_binary_mask_bgr(bgr_image)
 
         # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -264,8 +275,9 @@ class BeanBagTracker(Node):
         y_land: float | None,
         depth_land: float | None,
         zh: float,
+        first_bgr: np.ndarray | None,
     ) -> None:
-        """Save (x, y_cam, depth) 3D PNG under TRAJECTORY_DEBUG_PLOT_DIR (matplotlib Agg)."""
+        """Save dual-tile PNG: 3D trajectory (mpl X=x, Y=depth, Z=y_cam) + optional red-mask frame."""
         try:
             import matplotlib
 
@@ -286,32 +298,86 @@ class BeanBagTracker(Node):
         ys_c = np.asarray(ys, dtype=float).copy()
         depths_c = np.asarray(depths, dtype=float).copy()
 
-        fig = plt.figure(figsize=(7, 6))
-        ax = fig.add_subplot(111, projection='3d')
+        fig = plt.figure(figsize=(14, 6))
+        ax = fig.add_subplot(1, 2, 1, projection='3d')
 
         ax.scatter([0.0], [0.0], [0.0], c='k', s=80, marker='^', label='camera')
-        ax.plot(xs_c, ys_c, depths_c, 'b-', alpha=0.5, linewidth=1)
-        ax.scatter(xs_c, ys_c, depths_c, c='blue', s=35, label='3 samples')
-        ax.scatter([xs_c[0]], [ys_c[0]], [depths_c[0]], c='orange', s=120, marker='o', label='bag frame 1 (earliest)')
+        ax.plot(xs_c, depths_c, ys_c, 'b-', alpha=0.5, linewidth=1)
+        ax.scatter(xs_c, depths_c, ys_c, c='blue', s=35, label='3 samples')
+        ax.scatter(
+            [xs_c[0]], [depths_c[0]], [ys_c[0]],
+            c='orange', s=120, marker='o', label='bag frame 1 (earliest)',
+        )
 
+        arc_x = arc_y_cam = arc_depth = None
         if t_land is not None and x_land is not None and y_land is not None and depth_land is not None:
             if math.isfinite(t_land):
                 n = max(25, int(40 * (1.0 + min(abs(t_land), 5.0))))
                 tt = np.linspace(0.0, float(t_land), n)
                 arc_x = np.polyval(np.array([vx, x0]), tt)
-                arc_y = np.polyval(np.array([a_half, vy, y0]), tt)
-                arc_z = np.polyval(np.array([vz, z0]), tt)
-                ax.plot(arc_x, arc_y, arc_z, 'g--', alpha=0.7, linewidth=1.2, label='fit arc to t_land')
+                arc_y_cam = np.polyval(np.array([a_half, vy, y0]), tt)
+                arc_depth = np.polyval(np.array([vz, z0]), tt)
+                ax.plot(arc_x, arc_depth, arc_y_cam, 'g--', alpha=0.7, linewidth=1.2, label='fit arc to t_land')
             ax.scatter(
-                [x_land], [y_land], [depth_land],
+                [x_land], [depth_land], [y_land],
                 c='red', s=140, marker='*', label='predicted landing',
             )
 
+        x_parts = [xs_c, np.array([0.0])]
+        depth_parts = [depths_c, np.array([0.0])]
+        y_parts = [ys_c, np.array([0.0])]
+        if arc_x is not None:
+            x_parts.append(arc_x)
+            depth_parts.append(arc_depth)
+            y_parts.append(arc_y_cam)
+        if x_land is not None:
+            x_parts.append(np.array([float(x_land)]))
+            depth_parts.append(np.array([float(depth_land)]))
+            y_parts.append(np.array([float(y_land)]))
+
+        x_all = np.concatenate(x_parts)
+        depth_all = np.concatenate(depth_parts)
+        y_all = np.concatenate(y_parts)
+
+        x_abs = float(np.max(np.abs(x_all)))
+        if x_abs < 1e-6:
+            x_abs = 0.1
+        x_pad = max(0.02, 0.1 * x_abs)
+        ax.set_xlim(-x_abs - x_pad, x_abs + x_pad)
+
+        dmin = float(np.min(depth_all))
+        dmax = float(np.max(depth_all))
+        if dmax - dmin < 1e-6:
+            dmin -= 0.05
+            dmax += 0.05
+        else:
+            dm = 0.1 * (dmax - dmin)
+            dmin -= dm
+            dmax += dm
+        ax.set_ylim(dmin, dmax)
+
+        y_hi = float(np.max(y_all))
+        if y_hi < 1e-6:
+            y_hi = 0.05
+        y_pad = max(0.02, 0.05 * y_hi)
+        ax.set_zlim(0.0, y_hi + y_pad)
+
         ax.set_xlabel('x (m)')
-        ax.set_ylabel('y_cam (m)')
-        ax.set_zlabel('depth (m)')
-        ax.set_title('Trajectory debug (camera frame)')
+        ax.set_ylabel('depth (m)')
+        ax.set_zlabel('y_cam (m)')
+        ax.set_title('Trajectory (camera frame: floor x–depth, up y_cam)')
         ax.legend(loc='upper left', fontsize=8)
+
+        ax_img = fig.add_subplot(1, 2, 2)
+        if first_bgr is not None:
+            rgb = cv2.cvtColor(self._red_masked_bgr(first_bgr), cv2.COLOR_BGR2RGB)
+            ax_img.imshow(rgb)
+            ax_img.set_title('Frame 1 (red mask)')
+            ax_img.axis('off')
+        else:
+            ax_img.text(0.5, 0.5, 'no frame captured', ha='center', va='center', transform=ax_img.transAxes)
+            ax_img.axis('off')
+
         fig.text(0.02, 0.02, f'z_hole (range ref) = {zh:.4f} m', fontsize=8)
         fig.tight_layout()
 
@@ -350,6 +416,12 @@ class BeanBagTracker(Node):
             lines.extend(self._backtrack_sample_point_lines(t0)[1:])
             self._emit_bag_distance_backtrack(lines)
             return (False, False)
+
+        first_bgr = (
+            self._debug_first_frame_bgr.copy()
+            if self._debug_first_frame_bgr is not None
+            else None
+        )
 
         times = np.array([p[0] - t0 for p in self.points])
         xs = np.array([p[1] for p in self.points])
@@ -400,6 +472,7 @@ class BeanBagTracker(Node):
                 y_land=None,
                 depth_land=None,
                 zh=zh,
+                first_bgr=first_bgr,
             )
             return (False, True)
 
@@ -459,6 +532,7 @@ class BeanBagTracker(Node):
                 y_land=y_land,
                 depth_land=depth_land,
                 zh=zh,
+                first_bgr=first_bgr,
             )
             return (False, True)
 
@@ -487,6 +561,7 @@ class BeanBagTracker(Node):
             y_land=y_land,
             depth_land=depth_land,
             zh=zh,
+            first_bgr=first_bgr,
         )
 
         return (True, True)
