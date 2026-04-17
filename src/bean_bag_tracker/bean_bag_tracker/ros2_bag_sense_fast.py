@@ -79,7 +79,7 @@ class BeanBagTracker(Node):
         # Max miss (m): hypot(x_land, depth_land - z_hole); larger → no publish, keyboard still arms.
         self.declare_parameter('max_publish_distance_m', 0.5)
         # Largest purple contour must have at least this area (px²); 0 disables the check.
-        self.declare_parameter('min_purple_contour_area_px', 0.0)
+        self.declare_parameter('min_purple_contour_area_px', 500)
         self.hole_distance = self.get_parameter('hole_distance_inches').value * 0.0254  # convert to meters
         self.depth_scale = float(self.get_parameter('depth_scale').value)
         self.min_publish_interval = float(self.get_parameter('min_publish_interval_sec').value)
