@@ -19,6 +19,8 @@ from rclpy.time import Time
 
 # 3D trajectory debug PNGs (matplotlib Agg).
 TRAJECTORY_DEBUG_PLOT_DIR = '/home/cornholio/ros2_jazzy/log'
+# Agent mask-pipeline NDJSON (same folder as trajectory PNGs on the Pi).
+_DEBUG_LOG_PATH = os.path.join(TRAJECTORY_DEBUG_PLOT_DIR, 'debug-3db75d.log')
 
 # Purple HSV tuning (OpenCV BGR→HSV: H 0–179, S and V 0–255). Slightly wider for lighter / pastel purples.
 PURPLE_HSV_LOWER = (120, 50, 50)
@@ -29,7 +31,6 @@ PURPLE_MASK_MORPH_KERNEL_SIZE = 3
 PURPLE_MASK_MAX_PIXELS_TO_IGNORE = 100
 
 # region agent log
-_DEBUG_LOG_PATH = '/Users/guest_official/Cornhole_Motion/.cursor/debug-3db75d.log'
 _AGENT_MASK_LOG_INTERVAL_SEC = 0.35
 _agent_mask_log_last_mono = 0.0
 
@@ -66,6 +67,7 @@ def _agent_log_purple_mask_pipeline(
         'timestamp': int(time.time() * 1000),
     }
     try:
+        os.makedirs(TRAJECTORY_DEBUG_PLOT_DIR, exist_ok=True)
         with open(_DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
             f.write(json.dumps(payload) + '\n')
     except OSError:
