@@ -16,6 +16,12 @@
 #   source install/setup.bash
 #   ros2 run bean_bag_tracker ros2_bag_sense_fast
 #
+# Optional: require a minimum purple blob size in pixels (OpenCV contour area), e.g.::
+#
+#   ros2 run bean_bag_tracker ros2_bag_sense_fast --ros-args -p min_purple_contour_area_px:=300.0
+#
+# Or add ``parameters=[{'min_purple_contour_area_px': 300.0}]`` to the ``bag_tracker`` Node below.
+#
 #   # Terminal 3
 #   source install/setup.bash
 #   ros2 run arduino_serial_com omni_pwm_subscribe
@@ -42,6 +48,7 @@ def generate_launch_description() -> LaunchDescription:
         launch_arguments=[('initial_reset', 'true')],
     )
 
+    # Default min_purple_contour_area_px is 0 (disabled); see header comment to enable.
     bag_tracker = Node(
         package='bean_bag_tracker',
         executable='ros2_bag_sense_fast',

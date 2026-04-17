@@ -78,10 +78,13 @@ class BeanBagTracker(Node):
         self.declare_parameter('min_publish_interval_sec', 5.0)
         # Max miss (m): hypot(x_land, depth_land - z_hole); larger → no publish, keyboard still arms.
         self.declare_parameter('max_publish_distance_m', 0.5)
+        # Largest purple contour must have at least this area (px²); 0 disables the check.
+        self.declare_parameter('min_purple_contour_area_px', 0.0)
         self.hole_distance = self.get_parameter('hole_distance_inches').value * 0.0254  # convert to meters
         self.depth_scale = float(self.get_parameter('depth_scale').value)
         self.min_publish_interval = float(self.get_parameter('min_publish_interval_sec').value)
         self.max_publish_distance_m = float(self.get_parameter('max_publish_distance_m').value)
+        self._min_purple_contour_area_px = float(self.get_parameter('min_purple_contour_area_px').value)
 
         self._last_publish_mono = float('-inf')
         self._state_lock = threading.Lock()
@@ -93,7 +96,8 @@ class BeanBagTracker(Node):
         # State variables
         self.required_points = 3 
         self.state = 'IDLE'          # IDLE, COLLECTING, WAIT
-        self.points = []  # (t, x, y, depth_m, u_px, v_px) — u,v = purple blob centroid that frame
+        # (t, x, y, depth_m, u_px, v_px, purple_contour_area_px) — u,v = centroid; area = cv2.contourArea
+        self.points = []
         self._debug_first_frame_bgr: np.ndarray | None = None
         # Use a Reentrant group so the timer and subscriber can run simultaneously
         self.callback_group = ReentrantCallbackGroup()
@@ -127,6 +131,15 @@ class BeanBagTracker(Node):
             f'Depth scale is: {self.depth_scale} m/raw_unit '
             '(ROS param depth_scale; same role as depth_sensor.get_depth_scale())'
         )
+        if self._min_purple_contour_area_px > 0.0:
+            self.get_logger().info(
+                f'min_purple_contour_area_px is {self._min_purple_contour_area_px:g} '
+                '(largest purple contour must meet this area or detection is ignored)'
+            )
+        else:
+            self.get_logger().info(
+                'min_purple_contour_area_px is 0 (no minimum contour area; set ROS param to filter small blobs)'
+            )
 
     def camera_info_callback(self, msg):
         """Extract camera intrinsics once."""
@@ -143,13 +156,13 @@ class BeanBagTracker(Node):
             return
 
         color_image = self.bridge.imgmsg_to_cv2(color_msg, 'bgr8')
-        centroid = self.find_purple_centroid(color_image)
+        purple_hit = self.find_purple_centroid(color_image)
 
-        if centroid is None:
+        if purple_hit is None:
             return
 
         # 2. Extract 3D data
-        u, v = centroid
+        u, v, contour_area_px = purple_hit
         depth_image = self.bridge.imgmsg_to_cv2(depth_msg, '16UC1')
         depth_raw_u16 = int(depth_image[v, u])
         depth = depth_raw_u16 * self.depth_scale
@@ -168,13 +181,13 @@ class BeanBagTracker(Node):
                 elapsed = time.monotonic() - self._last_publish_mono
                 if elapsed < self.min_publish_interval:
                     return
-                self.points = [(t, x, y, depth, u, v)]
+                self.points = [(t, x, y, depth, u, v, contour_area_px)]
                 self.state = 'COLLECTING'
                 self._debug_first_frame_bgr = color_image.copy()
 
             # Add subsequent points
             elif self.state == 'COLLECTING':
-                self.points.append((t, x, y, depth, u, v))
+                self.points.append((t, x, y, depth, u, v, contour_area_px))
 
                 # TRIGGER: Once we hit 3, calculate and SHUT DOWN processing
                 if len(self.points) >= self.required_points:
@@ -235,7 +248,7 @@ class BeanBagTracker(Node):
         return cv2.bitwise_and(bgr, bgr, mask=mask)
 
     def find_purple_centroid(self, bgr_image):
-        """Detect the largest purple blob and return its centroid (u, v) or None."""
+        """Detect the largest purple blob; return (u, v, contour_area_px) or None."""
         mask = self._purple_binary_mask_bgr(bgr_image)
         if int(cv2.countNonZero(mask)) <= PURPLE_MASK_MAX_PIXELS_TO_IGNORE:
             return None
@@ -247,13 +260,16 @@ class BeanBagTracker(Node):
 
         # Largest contour by area
         largest = max(contours, key=cv2.contourArea)
+        area_px = float(cv2.contourArea(largest))
+        if self._min_purple_contour_area_px > 0.0 and area_px < self._min_purple_contour_area_px:
+            return None
         # Compute centroid using moments
         M = cv2.moments(largest)
         if M['m00'] == 0:
             return None
         cx = int(M['m10'] / M['m00'])
         cy = int(M['m01'] / M['m00'])
-        return (cx, cy)
+        return (cx, cy, area_px)
 
     @staticmethod
     def _xy_depth_to_uv(
@@ -277,11 +293,12 @@ class BeanBagTracker(Node):
             self._backtrack_depth_scale_line(),
             '  samples (t, x, y_cam, depth_m from uint16 * depth_scale):',
         ]
-        for i, (t_abs, xi, yi, di, ui, vi) in enumerate(self.points):
+        for i, (t_abs, xi, yi, di, ui, vi, a_px) in enumerate(self.points):
             tr = t_abs - t0
             lines.append(
                 f'    pt[{i}] t_ros={t_abs:.6f}s  t_rel={tr:.6f}s  '
-                f'x={xi:.6f}m  y_cam={yi:.6f}m  depth={di:.6f}m  blob_uv=({ui},{vi})'
+                f'x={xi:.6f}m  y_cam={yi:.6f}m  depth={di:.6f}m  blob_uv=({ui},{vi})  '
+                f'contour_area_px={a_px:.1f}'
             )
         return lines
 
@@ -310,12 +327,13 @@ class BeanBagTracker(Node):
         first_bgr: np.ndarray | None,
         blob_us: np.ndarray,
         blob_vs: np.ndarray,
+        blob_contour_areas_px: np.ndarray,
         fx: float | None,
         fy: float | None,
         cx: float | None,
         cy: float | None,
     ) -> None:
-        """Save 1×3 PNG: 3D trajectory, frame-1 mask with pt1 overlays only, HSV purple strip."""
+        """Save 2×3 PNG: 3D trajectory, frame-1 mask, HSV strip; y_cam vs x; y_cam vs depth (z)."""
         try:
             import matplotlib
 
@@ -337,9 +355,10 @@ class BeanBagTracker(Node):
         depths_c = np.asarray(depths, dtype=float).copy()
         bu = np.asarray(blob_us, dtype=int).ravel()
         bv = np.asarray(blob_vs, dtype=int).ravel()
+        b_area = np.asarray(blob_contour_areas_px, dtype=float).ravel()
 
-        fig = plt.figure(figsize=(20, 6))
-        ax = fig.add_subplot(1, 3, 1, projection='3d')
+        fig = plt.figure(figsize=(20, 10))
+        ax = fig.add_subplot(2, 3, 1, projection='3d')
 
         ax.scatter([0.0], [0.0], [0.0], c='k', s=80, marker='^', label='camera')
         ax.plot(xs_c, depths_c, ys_c, 'b-', alpha=0.5, linewidth=1)
@@ -408,7 +427,7 @@ class BeanBagTracker(Node):
         ax.set_title('Trajectory (camera frame: floor x–depth, up y_cam)')
         ax.legend(loc='upper left', fontsize=8)
 
-        ax_img = fig.add_subplot(1, 3, 2)
+        ax_img = fig.add_subplot(2, 3, 2)
         if first_bgr is not None:
             vis_bgr = self._purple_masked_bgr(first_bgr).copy()
             h_img, w_img = vis_bgr.shape[:2]
@@ -447,15 +466,30 @@ class BeanBagTracker(Node):
                 if 0 <= ub < w_img and 0 <= vb < h_img:
                     cv2.circle(vis_bgr, (ub, vb), blob_r, cyan_bgr, -1, lineType=cv2.LINE_AA)
                     cv2.circle(vis_bgr, (ub, vb), 1, (40, 40, 40), -1, lineType=cv2.LINE_AA)
+            if len(b_area) > 0:
+                a0 = float(b_area[0])
+                cv2.putText(
+                    vis_bgr,
+                    f'largest contour A={a0:.0f} px',
+                    (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
             rgb = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
             ax_img.imshow(rgb)
-            ax_img.set_title('Frame 1 only (pt1: mask + blob cyan + 3D reproject ring)')
+            img_title = 'Frame 1 (earliest sample): mask + blob + 3D reproject'
+            if len(b_area) > 0:
+                img_title += f' | contour A={float(b_area[0]):.0f} px'
+            ax_img.set_title(img_title)
             ax_img.axis('off')
         else:
             ax_img.text(0.5, 0.5, 'no frame captured', ha='center', va='center', transform=ax_img.transAxes)
             ax_img.axis('off')
 
-        ax_grad = fig.add_subplot(1, 3, 3)
+        ax_grad = fig.add_subplot(2, 3, 3)
         grad_bgr = purple_hsv_reference_gradient_bgr()
         ax_grad.imshow(cv2.cvtColor(grad_bgr, cv2.COLOR_BGR2RGB))
         ax_grad.set_title('Purple HSV band (H→, V↓, S=mid)')
@@ -463,8 +497,84 @@ class BeanBagTracker(Node):
         ax_grad.set_ylabel('value (low → high)')
         ax_grad.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
 
-        fig.text(0.02, 0.02, f'z_hole (range ref) = {zh:.4f} m', fontsize=8)
-        fig.tight_layout()
+        ax_yx = fig.add_subplot(2, 3, 4)
+        ax_yx.scatter([0.0], [0.0], c='k', s=50, marker='^', label='camera', zorder=5)
+        ax_yx.plot(xs_c, ys_c, 'b-', alpha=0.5, linewidth=1, label='samples')
+        ax_yx.scatter(xs_c, ys_c, c='blue', s=25, zorder=4)
+        ax_yx.scatter([xs_c[0]], [ys_c[0]], c='orange', s=80, marker='o', zorder=6)
+        for i in range(len(xs_c)):
+            if i < len(b_area):
+                ax_yx.annotate(
+                    f'{float(b_area[i]):.0f}px',
+                    (float(xs_c[i]), float(ys_c[i])),
+                    textcoords='offset points',
+                    xytext=(6, 6),
+                    fontsize=7,
+                    color='navy',
+                )
+        if arc_x is not None:
+            ax_yx.plot(arc_x, arc_y_cam, 'g--', alpha=0.7, linewidth=1.2, label='fit arc')
+        if x_land is not None and y_land is not None:
+            ax_yx.scatter([float(x_land)], [float(y_land)], c='red', s=100, marker='*', zorder=6, label='landing')
+        ax_yx.set_xlabel('x (m)')
+        ax_yx.set_ylabel('y_cam (m)')
+        ax_yx.set_title('y_cam vs x')
+        ax_yx.set_xlim(-x_abs - x_pad, x_abs + x_pad)
+        ax_yx.set_ylim(0.0, y_hi + y_pad)
+        ax_yx.grid(True, alpha=0.3)
+        ax_yx.legend(loc='upper left', fontsize=7)
+
+        ax_ydepth = fig.add_subplot(2, 3, 5)
+        ax_ydepth.plot(depths_c, ys_c, 'b-', alpha=0.5, linewidth=1, label='samples')
+        ax_ydepth.scatter(depths_c, ys_c, c='blue', s=25, zorder=4)
+        ax_ydepth.scatter([depths_c[0]], [ys_c[0]], c='orange', s=80, marker='o', zorder=6)
+        for i in range(len(depths_c)):
+            if i < len(b_area):
+                ax_ydepth.annotate(
+                    f'{float(b_area[i]):.0f}px',
+                    (float(depths_c[i]), float(ys_c[i])),
+                    textcoords='offset points',
+                    xytext=(6, 6),
+                    fontsize=7,
+                    color='navy',
+                )
+        if arc_depth is not None:
+            ax_ydepth.plot(arc_depth, arc_y_cam, 'g--', alpha=0.7, linewidth=1.2, label='fit arc')
+        if depth_land is not None and y_land is not None:
+            ax_ydepth.scatter(
+                [float(depth_land)], [float(y_land)], c='red', s=100, marker='*', zorder=6, label='landing'
+            )
+        ax_ydepth.axvline(float(zh), color='gray', linestyle=':', linewidth=1.2, label='z_hole')
+        ax_ydepth.set_xlabel('depth z (m)')
+        ax_ydepth.set_ylabel('y_cam (m)')
+        ax_ydepth.set_title('y_cam vs depth (z)')
+        ax_ydepth.set_xlim(dmin, dmax)
+        ax_ydepth.set_ylim(0.0, y_hi + y_pad)
+        ax_ydepth.grid(True, alpha=0.3)
+        ax_ydepth.legend(loc='upper left', fontsize=7)
+
+        ax_spacer = fig.add_subplot(2, 3, 6)
+        ax_spacer.axis('off')
+        if len(b_area) > 0:
+            area_lines = ['Largest purple contour area', '(cv2.contourArea, px):']
+            for i in range(len(b_area)):
+                area_lines.append(f'  sample {i}: {float(b_area[i]):.0f}')
+            ax_spacer.text(
+                0.05,
+                0.95,
+                '\n'.join(area_lines),
+                transform=ax_spacer.transAxes,
+                va='top',
+                ha='left',
+                fontsize=10,
+                family='monospace',
+            )
+
+        footer = f'z_hole (range ref) = {zh:.4f} m'
+        if len(b_area) > 0:
+            footer += '  |  contour A (px): ' + ', '.join(f'{float(a):.0f}' for a in b_area)
+        fig.text(0.02, 0.01, footer, fontsize=8)
+        fig.tight_layout(rect=(0, 0.04, 1, 0.98))
 
         out_path = os.path.join(out_dir, f'trajectory_debug_{time.time_ns()}.png')
         try:
@@ -514,6 +624,7 @@ class BeanBagTracker(Node):
         depths = np.array([p[3] for p in self.points])
         blob_us = np.array([p[4] for p in self.points], dtype=int)
         blob_vs = np.array([p[5] for p in self.points], dtype=int)
+        blob_areas = np.array([p[6] for p in self.points], dtype=float)
 
         coeffs_x = np.polyfit(times, xs, 1)
         coeffs_y = np.polyfit(times, ys, 2)
@@ -562,6 +673,7 @@ class BeanBagTracker(Node):
                 first_bgr=first_bgr,
                 blob_us=blob_us,
                 blob_vs=blob_vs,
+                blob_contour_areas_px=blob_areas,
                 fx=self.fx,
                 fy=self.fy,
                 cx=self.cx,
@@ -628,6 +740,7 @@ class BeanBagTracker(Node):
                 first_bgr=first_bgr,
                 blob_us=blob_us,
                 blob_vs=blob_vs,
+                blob_contour_areas_px=blob_areas,
                 fx=self.fx,
                 fy=self.fy,
                 cx=self.cx,
@@ -663,6 +776,7 @@ class BeanBagTracker(Node):
             first_bgr=first_bgr,
             blob_us=blob_us,
             blob_vs=blob_vs,
+            blob_contour_areas_px=blob_areas,
             fx=self.fx,
             fy=self.fy,
             cx=self.cx,
