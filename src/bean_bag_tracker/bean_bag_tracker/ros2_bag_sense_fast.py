@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# --- TEMP debug context (remove when cleaning agent NDJSON) ---
+# Pi NDJSON: TRAJECTORY_DEBUG_PLOT_DIR / debug-3db75d.log (sessionId 3db75d).
+# Pre-fix logs: MORPH_OPEN after inRange dropped most mask pixels (open_over_raw often ~0.05-0.22;
+# sometimes after_open_n=0 while raw_inRange_n~220). H2 CONFIRMED (open strips thin/pastel purple).
+# after_close_n matched after_open_n when open had already erased regions; H3 CONFIRMED (close
+# cannot restore what open removed). raw_inRange_n was often hundreds+ so H1 REJECTED as primary.
+# Fix: _purple_binary_mask_from_hsv uses MORPH_CLOSE only (no OPEN). Post-fix agent lines use
+# runId post-fix, morph_pipeline close_only, field close_over_raw (expect near 1 vs sparse scenes).
+# --- end TEMP debug context ---
 import json
 import math
 import os
@@ -25,7 +34,8 @@ _DEBUG_LOG_PATH = os.path.join(TRAJECTORY_DEBUG_PLOT_DIR, 'debug-3db75d.log')
 # Purple HSV tuning (OpenCV BGR→HSV: H 0–179, S and V 0–255). Slightly wider for lighter / pastel purples.
 PURPLE_HSV_LOWER = (120, 50, 50)
 PURPLE_HSV_UPPER = (140, 200, 255)
-# Square kernel edge length for open/close (e.g. 3 = gentler than 5).
+# Square kernel edge length for morphological **close** on the purple mask (open was removed:
+# runtime logs showed MORPH_OPEN kept under ~23% of inRange pixels for sparse/pastel purple).
 PURPLE_MASK_MORPH_KERNEL_SIZE = 3
 # Ignore detection when the purple mask has this many pixels or fewer (noise guard).
 PURPLE_MASK_MAX_PIXELS_TO_IGNORE = 100
@@ -39,11 +49,10 @@ def _agent_log_purple_mask_pipeline(
     *,
     k: int,
     raw_n: int,
-    open_n: int,
-    close_n: int,
+    after_close_n: int,
     frame_hw: int,
 ) -> None:
-    """NDJSON debug: pixel counts after inRange vs morph (hypotheses H2 open strips, H3 close effect)."""
+    """NDJSON debug: inRange vs after MORPH_CLOSE only (open removed)."""
     global _agent_mask_log_last_mono
     t = time.monotonic()
     if t - _agent_mask_log_last_mono < _AGENT_MASK_LOG_INTERVAL_SEC:
@@ -51,18 +60,17 @@ def _agent_log_purple_mask_pipeline(
     _agent_mask_log_last_mono = t
     payload = {
         'sessionId': '3db75d',
-        'hypothesisId': 'H2_open_H3_close_morph',
+        'hypothesisId': 'verify_close_only_pipeline',
+        'runId': 'post-fix',
         'location': 'ros2_bag_sense_fast.py:_purple_binary_mask_from_hsv',
         'message': 'purple_mask_pipeline_pixel_counts',
         'data': {
+            'morph_pipeline': 'close_only',
             'k': k,
             'raw_inRange_n': raw_n,
-            'after_open_n': open_n,
-            'after_close_n': close_n,
+            'after_close_n': after_close_n,
             'frame_pixels': frame_hw,
-            'open_over_raw': (open_n / raw_n) if raw_n > 0 else None,
-            'close_over_raw': (close_n / raw_n) if raw_n > 0 else None,
-            'raw_minus_open': raw_n - open_n,
+            'close_over_raw': (after_close_n / raw_n) if raw_n > 0 else None,
         },
         'timestamp': int(time.time() * 1000),
     }
@@ -294,7 +302,10 @@ class BeanBagTracker(Node):
         self._debug_first_frame_bgr = None
 
     def _purple_binary_mask_from_hsv(self, hsv: np.ndarray) -> np.ndarray:
-        """Purple in-range mask (8-bit) after morphology, from full-frame BGR→HSV image."""
+        """Purple in-range mask (8-bit) after MORPH_CLOSE only, from full-frame BGR→HSV image.
+
+        MORPH_OPEN was removed: it erased most thin/pastel inRange regions (see agent NDJSON logs).
+        """
         lower = np.array(PURPLE_HSV_LOWER, dtype=np.uint8)
         upper = np.array(PURPLE_HSV_UPPER, dtype=np.uint8)
         mask = cv2.inRange(hsv, lower, upper)
@@ -302,23 +313,20 @@ class BeanBagTracker(Node):
 
         k = max(1, int(PURPLE_MASK_MORPH_KERNEL_SIZE))
         kernel = np.ones((k, k), np.uint8)
-        mask_after_open = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        open_n = int(cv2.countNonZero(mask_after_open))
-        mask = cv2.morphologyEx(mask_after_open, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         close_n = int(cv2.countNonZero(mask))
         # region agent log
         _agent_log_purple_mask_pipeline(
             k=k,
             raw_n=raw_n,
-            open_n=open_n,
-            close_n=close_n,
+            after_close_n=close_n,
             frame_hw=int(hsv.shape[0] * hsv.shape[1]),
         )
         # endregion
         return mask
 
     def _purple_binary_mask_bgr(self, bgr: np.ndarray) -> np.ndarray:
-        """HSV purple mask (8-bit) after morphology; same semantics as find_purple_centroid pre-contours."""
+        """HSV purple mask (8-bit) after inRange + close; same semantics as find_purple_centroid pre-contours."""
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         return self._purple_binary_mask_from_hsv(hsv)
 
