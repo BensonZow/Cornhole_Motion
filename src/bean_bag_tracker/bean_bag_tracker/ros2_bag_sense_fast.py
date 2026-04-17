@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import math
 import os
 import sys
@@ -26,6 +27,52 @@ PURPLE_HSV_UPPER = (140, 200, 255)
 PURPLE_MASK_MORPH_KERNEL_SIZE = 3
 # Ignore detection when the purple mask has this many pixels or fewer (noise guard).
 PURPLE_MASK_MAX_PIXELS_TO_IGNORE = 100
+
+# region agent log
+_DEBUG_LOG_PATH = '/Users/guest_official/Cornhole_Motion/.cursor/debug-3db75d.log'
+_AGENT_MASK_LOG_INTERVAL_SEC = 0.35
+_agent_mask_log_last_mono = 0.0
+
+
+def _agent_log_purple_mask_pipeline(
+    *,
+    k: int,
+    raw_n: int,
+    open_n: int,
+    close_n: int,
+    frame_hw: int,
+) -> None:
+    """NDJSON debug: pixel counts after inRange vs morph (hypotheses H2 open strips, H3 close effect)."""
+    global _agent_mask_log_last_mono
+    t = time.monotonic()
+    if t - _agent_mask_log_last_mono < _AGENT_MASK_LOG_INTERVAL_SEC:
+        return
+    _agent_mask_log_last_mono = t
+    payload = {
+        'sessionId': '3db75d',
+        'hypothesisId': 'H2_open_H3_close_morph',
+        'location': 'ros2_bag_sense_fast.py:_purple_binary_mask_from_hsv',
+        'message': 'purple_mask_pipeline_pixel_counts',
+        'data': {
+            'k': k,
+            'raw_inRange_n': raw_n,
+            'after_open_n': open_n,
+            'after_close_n': close_n,
+            'frame_pixels': frame_hw,
+            'open_over_raw': (open_n / raw_n) if raw_n > 0 else None,
+            'close_over_raw': (close_n / raw_n) if raw_n > 0 else None,
+            'raw_minus_open': raw_n - open_n,
+        },
+        'timestamp': int(time.time() * 1000),
+    }
+    try:
+        with open(_DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(payload) + '\n')
+    except OSError:
+        pass
+
+
+# endregion
 
 
 def purple_hsv_reference_gradient_bgr() -> np.ndarray:
@@ -249,11 +296,23 @@ class BeanBagTracker(Node):
         lower = np.array(PURPLE_HSV_LOWER, dtype=np.uint8)
         upper = np.array(PURPLE_HSV_UPPER, dtype=np.uint8)
         mask = cv2.inRange(hsv, lower, upper)
+        raw_n = int(cv2.countNonZero(mask))
 
         k = max(1, int(PURPLE_MASK_MORPH_KERNEL_SIZE))
         kernel = np.ones((k, k), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask_after_open = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        open_n = int(cv2.countNonZero(mask_after_open))
+        mask = cv2.morphologyEx(mask_after_open, cv2.MORPH_CLOSE, kernel)
+        close_n = int(cv2.countNonZero(mask))
+        # region agent log
+        _agent_log_purple_mask_pipeline(
+            k=k,
+            raw_n=raw_n,
+            open_n=open_n,
+            close_n=close_n,
+            frame_hw=int(hsv.shape[0] * hsv.shape[1]),
+        )
+        # endregion
         return mask
 
     def _purple_binary_mask_bgr(self, bgr: np.ndarray) -> np.ndarray:
