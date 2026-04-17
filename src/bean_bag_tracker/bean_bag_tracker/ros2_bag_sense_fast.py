@@ -20,8 +20,8 @@ from rclpy.time import Time
 TRAJECTORY_DEBUG_PLOT_DIR = '/home/cornholio/ros2_jazzy/log'
 
 # Purple HSV tuning (OpenCV BGR→HSV: H 0–179, S and V 0–255). Slightly wider for lighter / pastel purples.
-PURPLE_HSV_LOWER = (118, 35, 15)
-PURPLE_HSV_UPPER = (172, 255, 245)
+PURPLE_HSV_LOWER = (140, 110, 150)
+PURPLE_HSV_UPPER = (160, 195, 245)
 # Square kernel edge length for open/close (e.g. 3 = gentler than 5).
 PURPLE_MASK_MORPH_KERNEL_SIZE = 3
 # Ignore detection when the purple mask has this many pixels or fewer (noise guard).
