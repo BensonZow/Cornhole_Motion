@@ -22,6 +22,10 @@
 #
 # Or add ``parameters=[{'min_purple_contour_area_px': 300.0}]`` to the ``bag_tracker`` Node below.
 #
+# Optional: INFO-log HSV breakdown for the winning purple blob (filled region + contour ring)::
+#
+#   ros2 run bean_bag_tracker ros2_bag_sense_fast --ros-args -p debug_log_purple_blob_hsv:=true
+#
 #   # Terminal 3
 #   source install/setup.bash
 #   ros2 run arduino_serial_com omni_pwm_subscribe

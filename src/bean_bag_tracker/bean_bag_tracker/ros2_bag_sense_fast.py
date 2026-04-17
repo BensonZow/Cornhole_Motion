@@ -20,7 +20,7 @@ from rclpy.time import Time
 TRAJECTORY_DEBUG_PLOT_DIR = '/home/cornholio/ros2_jazzy/log'
 
 # Purple HSV tuning (OpenCV BGR→HSV: H 0–179, S and V 0–255). Slightly wider for lighter / pastel purples.
-PURPLE_HSV_LOWER = (125, 50, 50)
+PURPLE_HSV_LOWER = (120, 50, 50)
 PURPLE_HSV_UPPER = (140, 200, 255)
 # Square kernel edge length for open/close (e.g. 3 = gentler than 5).
 PURPLE_MASK_MORPH_KERNEL_SIZE = 3
@@ -80,13 +80,22 @@ class BeanBagTracker(Node):
         self.declare_parameter('max_publish_distance_m', 0.5)
         # Largest purple contour must have at least this area (px²); 0 disables the check.
         self.declare_parameter('min_purple_contour_area_px', 500)
+        # Log min/max/mean/p50 HSV for filled blob and contour boundary (OpenCV 8-bit HSV).
+        self.declare_parameter('debug_log_purple_blob_hsv', False)
+        # Min seconds between such logs when enabled (0 = log every successful detection).
+        self.declare_parameter('debug_log_purple_hsv_interval_sec', 0.25)
         self.hole_distance = self.get_parameter('hole_distance_inches').value * 0.0254  # convert to meters
         self.depth_scale = float(self.get_parameter('depth_scale').value)
         self.min_publish_interval = float(self.get_parameter('min_publish_interval_sec').value)
         self.max_publish_distance_m = float(self.get_parameter('max_publish_distance_m').value)
         self._min_purple_contour_area_px = float(self.get_parameter('min_purple_contour_area_px').value)
+        self._debug_log_purple_blob_hsv = bool(self.get_parameter('debug_log_purple_blob_hsv').value)
+        self._debug_log_purple_hsv_interval_sec = float(
+            self.get_parameter('debug_log_purple_hsv_interval_sec').value
+        )
 
         self._last_publish_mono = float('-inf')
+        self._last_purple_hsv_log_mono = float('-inf')
         self._state_lock = threading.Lock()
         self._pending_keyboard_reset = False
         self._stdin_arm_thread: threading.Thread | None = None
@@ -139,6 +148,11 @@ class BeanBagTracker(Node):
         else:
             self.get_logger().info(
                 'min_purple_contour_area_px is 0 (no minimum contour area; set ROS param to filter small blobs)'
+            )
+        if self._debug_log_purple_blob_hsv:
+            self.get_logger().info(
+                'debug_log_purple_blob_hsv is ON — INFO logs with HSV stats for winning purple blob '
+                f'(rate: debug_log_purple_hsv_interval_sec={self._debug_log_purple_hsv_interval_sec:g})'
             )
 
     def camera_info_callback(self, msg):
@@ -230,9 +244,8 @@ class BeanBagTracker(Node):
         self.points.clear()
         self._debug_first_frame_bgr = None
 
-    def _purple_binary_mask_bgr(self, bgr: np.ndarray) -> np.ndarray:
-        """HSV purple mask (8-bit) after morphology; same semantics as find_purple_centroid pre-contours."""
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    def _purple_binary_mask_from_hsv(self, hsv: np.ndarray) -> np.ndarray:
+        """Purple in-range mask (8-bit) after morphology, from full-frame BGR→HSV image."""
         lower = np.array(PURPLE_HSV_LOWER, dtype=np.uint8)
         upper = np.array(PURPLE_HSV_UPPER, dtype=np.uint8)
         mask = cv2.inRange(hsv, lower, upper)
@@ -243,13 +256,55 @@ class BeanBagTracker(Node):
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         return mask
 
+    def _purple_binary_mask_bgr(self, bgr: np.ndarray) -> np.ndarray:
+        """HSV purple mask (8-bit) after morphology; same semantics as find_purple_centroid pre-contours."""
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        return self._purple_binary_mask_from_hsv(hsv)
+
     def _purple_masked_bgr(self, bgr: np.ndarray) -> np.ndarray:
         mask = self._purple_binary_mask_bgr(bgr)
         return cv2.bitwise_and(bgr, bgr, mask=mask)
 
+    @staticmethod
+    def _hsv_channel_summary(ch: np.ndarray) -> str:
+        if ch.size == 0:
+            return 'min=- max=- mean=- p50=-'
+        return (
+            f'min={int(np.min(ch))} max={int(np.max(ch))} '
+            f'mean={float(np.mean(ch)):.2f} p50={int(np.percentile(ch, 50))}'
+        )
+
+    def _log_purple_blob_hsv_breakdown(
+        self,
+        hsv: np.ndarray,
+        filled_sel: np.ndarray,
+        boundary_sel: np.ndarray,
+        area_px: float,
+    ) -> None:
+        """One multiline INFO log: H/S/V ranges for blob interior vs contour ring (OpenCV HSV)."""
+        lines = [
+            'purple_blob HSV stats (OpenCV 8-bit: H in [0,179], S and V in [0,255]):',
+            f'  cv2.contourArea(largest)={area_px:.1f} px',
+        ]
+        for label, sel in (
+            ('filled & morph_mask (blob used for centroid)', filled_sel),
+            ('contour boundary (drawContours thickness=1)', boundary_sel),
+        ):
+            if not np.any(sel):
+                lines.append(f'  {label}: 0 pixels (skip)')
+                continue
+            pix = hsv[sel]
+            h_ch, s_ch, v_ch = pix[:, 0], pix[:, 1], pix[:, 2]
+            lines.append(f'  {label}: n={pix.shape[0]}')
+            lines.append(f'    H  {self._hsv_channel_summary(h_ch)}')
+            lines.append(f'    S  {self._hsv_channel_summary(s_ch)}')
+            lines.append(f'    V  {self._hsv_channel_summary(v_ch)}')
+        self.get_logger().info('\n'.join(lines))
+
     def find_purple_centroid(self, bgr_image):
         """Detect the largest purple blob; return (u, v, contour_area_px) or None."""
-        mask = self._purple_binary_mask_bgr(bgr_image)
+        hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
+        mask = self._purple_binary_mask_from_hsv(hsv)
         if int(cv2.countNonZero(mask)) <= PURPLE_MASK_MAX_PIXELS_TO_IGNORE:
             return None
 
@@ -263,6 +318,23 @@ class BeanBagTracker(Node):
         area_px = float(cv2.contourArea(largest))
         if self._min_purple_contour_area_px > 0.0 and area_px < self._min_purple_contour_area_px:
             return None
+
+        h_img, w_img = hsv.shape[:2]
+        blob_fill = np.zeros((h_img, w_img), dtype=np.uint8)
+        cv2.drawContours(blob_fill, [largest], -1, 255, thickness=-1)
+        filled_sel = (blob_fill > 0) & (mask > 0)
+
+        boundary = np.zeros((h_img, w_img), dtype=np.uint8)
+        cv2.drawContours(boundary, [largest], -1, 255, thickness=1)
+        boundary_sel = boundary > 0
+
+        if self._debug_log_purple_blob_hsv:
+            now = time.monotonic()
+            interval = self._debug_log_purple_hsv_interval_sec
+            if interval <= 0.0 or (now - self._last_purple_hsv_log_mono) >= interval:
+                self._last_purple_hsv_log_mono = now
+                self._log_purple_blob_hsv_breakdown(hsv, filled_sel, boundary_sel, area_px)
+
         # Compute centroid using moments
         M = cv2.moments(largest)
         if M['m00'] == 0:
