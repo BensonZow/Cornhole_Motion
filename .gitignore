@@ -16,3 +16,12 @@ src/ros/pluginlib/
 **/__pycache__/
 # Ignore all compiled python files
 *.pyc
+
+# Training data / captures (large, local)
+training/
+
+# Cursor IDE (local session metadata)
+.cursor/
+
+# Local venv for Ultralytics / NN (see README)
+ultralytics_env/
