@@ -10,10 +10,18 @@ Loads weights via Ultralytics (e.g. YOLO26n ``yolo26n.pt``). ROS 2 ``std_msgs/Fl
 Corners are axis-aligned box vertices in **original color pixel coordinates**, order:
 top-left, top-right, bottom-right, bottom-left. When nothing exceeds ``confidence_threshold``,
 ``confidence`` is ``0.0`` and all coordinates are ``0.0``.
+
+When ``stream_snapshots_enabled`` is true, among detections at or above ``stream_snapshot_min_conf`` the
+highest-confidence box is chosen for the message and for labeled PNGs under
+``stream_snapshot_output_dir`` (rate-limited by ``stream_snapshot_min_interval_sec``).
+PNG writes run on a background queue so inference is not blocked by disk I/O.
 """
 from __future__ import annotations
 
 import os
+import queue
+import sys
+import threading
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -92,6 +100,39 @@ def _xyxy_to_corners_tl_tr_br_bl(xyxy: np.ndarray) -> np.ndarray:
     )
 
 
+def _render_labeled_snapshot(bgr: np.ndarray, conf: float, corners: np.ndarray | None) -> np.ndarray:
+    """BGR copy with axis-aligned box (TL..BL) and confidence text."""
+    vis = bgr.copy()
+    h, w = vis.shape[:2]
+    if conf > 0.0 and corners is not None and corners.shape == (4, 2):
+        pts = np.round(corners).astype(np.int32).reshape(1, 4, 2)
+        cv2.polylines(vis, pts, isClosed=True, color=(0, 220, 0), thickness=2, lineType=cv2.LINE_AA)
+        x0 = int(np.clip(pts[0, :, 0].min(), 0, w - 1))
+        y0 = int(np.clip(pts[0, :, 1].min() - 8, 20, h - 1))
+        cv2.putText(
+            vis,
+            f'conf={conf:.3f}',
+            (x0, y0),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    else:
+        cv2.putText(
+            vis,
+            'no detection (conf=0)',
+            (16, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (80, 80, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    return vis
+
+
 def _clip_xyxy(xyxy: np.ndarray, h0: int, w0: int) -> np.ndarray:
     x = xyxy.astype(np.float32).copy()
     x[[0, 2]] = np.clip(x[[0, 2]], 0.0, float(w0 - 1))
@@ -143,6 +184,14 @@ class BeanBagNnDetector(Node):
         self.declare_parameter('max_fps', 0.0)
         self.declare_parameter('device', 'cpu')
         self.declare_parameter('class_ids', [])
+        # Labeled PNGs on ``y``+Enter (see ``_stdin_y_snapshot_loop``).
+        self.declare_parameter('snapshot_output_dir', '/home/cornholio/ros2_jazzy/log/NN')
+        self.declare_parameter('enable_y_snapshot', True)
+        self.declare_parameter('stream_snapshots_enabled', True)
+        self.declare_parameter('stream_snapshot_min_conf', 0.4)
+        self.declare_parameter('stream_snapshot_min_interval_sec', 0.0)
+        self.declare_parameter('stream_snapshot_output_dir', '')
+        self.declare_parameter('stream_write_queue_size', 8)
 
         self._bridge = CvBridge()
         self._conf_thr = _scalar_float('confidence_threshold', self.get_parameter('confidence_threshold').value)
@@ -157,6 +206,33 @@ class BeanBagNnDetector(Node):
         else:
             self._class_ids = [int(raw_classes)]
         self._last_infer_mono = 0.0
+
+        self._snapshot_dir = os.path.expanduser(str(self.get_parameter('snapshot_output_dir').value).strip())
+        self._enable_y_snapshot = bool(self.get_parameter('enable_y_snapshot').value)
+        self._stream_snapshots_enabled = bool(self.get_parameter('stream_snapshots_enabled').value)
+        self._stream_min_conf = _scalar_float(
+            'stream_snapshot_min_conf',
+            self.get_parameter('stream_snapshot_min_conf').value,
+        )
+        self._stream_interval = max(
+            0.0,
+            _scalar_float(
+                'stream_snapshot_min_interval_sec',
+                self.get_parameter('stream_snapshot_min_interval_sec').value,
+            ),
+        )
+        raw_stream_out = str(self.get_parameter('stream_snapshot_output_dir').value).strip()
+        if raw_stream_out:
+            self._stream_out_dir = os.path.expanduser(raw_stream_out)
+        else:
+            self._stream_out_dir = os.path.join(self._snapshot_dir, 'stream')
+        self._last_stream_save_mono = float('-inf')
+        self._stream_queue: queue.Queue[tuple[str, np.ndarray]] | None = None
+        self._stream_writer_thread: threading.Thread | None = None
+        self._frame_lock = threading.Lock()
+        self._snap_bgr: np.ndarray | None = None
+        self._snap_conf: float = 0.0
+        self._snap_corners: np.ndarray | None = None
 
         model_path = self.get_parameter('model_path').value
         if not model_path or not str(model_path).strip():
@@ -199,12 +275,137 @@ class BeanBagNnDetector(Node):
             10,
         )
 
+        if self._enable_y_snapshot:
+            self._stdin_snapshot_thread = threading.Thread(target=self._stdin_y_snapshot_loop, daemon=True)
+            self._stdin_snapshot_thread.start()
+            self.get_logger().info(
+                f'Y-snapshot enabled: type y then Enter in this terminal to save a labeled PNG under '
+                f'{self._snapshot_dir!r}'
+            )
+        if self._stream_snapshots_enabled:
+            qsz = max(
+                1,
+                _scalar_int(
+                    'stream_write_queue_size',
+                    self.get_parameter('stream_write_queue_size').value,
+                ),
+            )
+            self._stream_queue = queue.Queue(maxsize=qsz)
+            self._stream_writer_thread = threading.Thread(target=self._stream_writer_loop, daemon=True)
+            self._stream_writer_thread.start()
+            self.get_logger().info(
+                f'Stream snapshots: conf>={self._stream_min_conf:g} -> {self._stream_out_dir!r} '
+                f'(min_interval_sec={self._stream_interval:g}, async write queue={qsz})',
+            )
+
+    def _stream_writer_loop(self) -> None:
+        q = self._stream_queue
+        if q is None:
+            return
+        while rclpy.ok():
+            try:
+                out_path, vis = q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                if not cv2.imwrite(out_path, vis):
+                    self.get_logger().error(f'cv2.imwrite failed for stream snapshot {out_path!r}')
+            except cv2.error as e:
+                self.get_logger().error(f'OpenCV imwrite error (stream worker): {e}')
+
+    def _enqueue_stream_png(self, out_path: str, vis: np.ndarray) -> None:
+        q = self._stream_queue
+        if q is None:
+            try:
+                if not cv2.imwrite(out_path, vis):
+                    self.get_logger().error(f'cv2.imwrite failed for stream snapshot {out_path!r}')
+            except cv2.error as e:
+                self.get_logger().error(f'OpenCV imwrite error (stream): {e}')
+            return
+        item = (out_path, vis)
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(item)
+            except queue.Full:
+                pass
+
+    def _maybe_save_stream_snapshot(
+        self,
+        bgr: np.ndarray,
+        conf: float,
+        corners: np.ndarray | None,
+    ) -> None:
+        if not self._stream_snapshots_enabled or conf + 1e-9 < self._stream_min_conf:
+            return
+        now = time.monotonic()
+        if self._stream_interval > 0.0 and (now - self._last_stream_save_mono) < self._stream_interval:
+            return
+        self._last_stream_save_mono = now
+        try:
+            os.makedirs(self._stream_out_dir, exist_ok=True)
+        except OSError as e:
+            self.get_logger().error(f'Cannot create stream snapshot directory {self._stream_out_dir!r}: {e}')
+            return
+        vis = _render_labeled_snapshot(bgr, conf, corners)
+        out_path = os.path.join(
+            self._stream_out_dir,
+            f'nn_stream_{time.time_ns()}_{conf:.4f}.png',
+        )
+        self._enqueue_stream_png(out_path, vis)
+
+    def _stdin_y_snapshot_loop(self) -> None:
+        sys.stdout.write('Type y then Enter to save the latest frame with NN labels to log/NN...\n')
+        sys.stdout.flush()
+        while rclpy.ok():
+            try:
+                line = input()
+            except EOFError:
+                return
+            if line.strip().casefold() != 'y':
+                continue
+            self._save_y_snapshot()
+
+    def _save_y_snapshot(self) -> None:
+        out_dir = self._snapshot_dir
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as e:
+            self.get_logger().error(f'Cannot create snapshot directory {out_dir!r}: {e}')
+            return
+
+        with self._frame_lock:
+            if self._snap_bgr is None:
+                self.get_logger().warn('No camera frame received yet; skipping PNG save.')
+                return
+            bgr = self._snap_bgr.copy()
+            conf = float(self._snap_conf)
+            corners = None if self._snap_corners is None else self._snap_corners.copy()
+
+        vis = _render_labeled_snapshot(bgr, conf, corners)
+        out_path = os.path.join(out_dir, f'nn_label_{time.time_ns()}.png')
+        try:
+            if not cv2.imwrite(out_path, vis):
+                self.get_logger().error(f'cv2.imwrite failed for {out_path!r}')
+                return
+        except cv2.error as e:
+            self.get_logger().error(f'OpenCV imwrite error: {e}')
+            return
+        self.get_logger().info(f'Saved labeled snapshot: {out_path}')
+
     def _package_share_dir(self) -> str:
         from ament_index_python.packages import get_package_share_directory
 
         return get_package_share_directory('bean_bag_tracker')
 
     def _color_cb(self, msg: Image) -> None:
+        if not rclpy.ok():
+            return
         if self._max_fps > 0.0:
             now = time.monotonic()
             min_dt = 1.0 / self._max_fps
@@ -215,10 +416,13 @@ class BeanBagNnDetector(Node):
         bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         h0, w0 = bgr.shape[:2]
 
+        yolo_conf = float(self._conf_thr)
+        if self._stream_snapshots_enabled:
+            yolo_conf = float(min(self._conf_thr, self._stream_min_conf))
         kwargs: dict[str, Any] = {
             'source': bgr,
             'imgsz': int(self._inf_size),
-            'conf': float(self._conf_thr),
+            'conf': yolo_conf,
             'device': self._device,
             'verbose': False,
             'half': False,
@@ -239,26 +443,85 @@ class BeanBagNnDetector(Node):
                 )
             raise
         row = np.zeros((1, 9), dtype=np.float32)
+        snap_conf = 0.0
+        snap_corners: np.ndarray | None = None
 
         if results:
             r = results[0]
             if r.boxes is not None and len(r.boxes) > 0:
                 xyxy = r.boxes.xyxy.cpu().numpy().astype(np.float32)
                 confs = r.boxes.conf.cpu().numpy().astype(np.float32)
-                idx = int(np.argmax(confs))
-                best = _clip_xyxy(xyxy[idx], h0, w0)
-                corners = _xyxy_to_corners_tl_tr_br_bl(best)
-                flat = corners.reshape(8).astype(np.float32)
-                row = np.concatenate([[float(confs[idx])], flat]).reshape(1, 9).astype(np.float32)
+                if self._stream_snapshots_enabled:
+                    sel = confs >= (self._stream_min_conf - 1e-9)
+                else:
+                    sel = np.ones(len(confs), dtype=bool)
+                if np.any(sel):
+                    masked = np.where(sel, confs, -1.0)
+                    idx = int(np.argmax(masked))
+                    best = _clip_xyxy(xyxy[idx], h0, w0)
+                    corners = _xyxy_to_corners_tl_tr_br_bl(best)
+                    flat = corners.reshape(8).astype(np.float32)
+                    row = np.concatenate([[float(confs[idx])], flat]).reshape(1, 9).astype(np.float32)
+                    snap_conf = float(confs[idx])
+                    snap_corners = corners.copy()
+
+        if self._stream_snapshots_enabled:
+            self._maybe_save_stream_snapshot(bgr, snap_conf, snap_corners)
+
+        if self._enable_y_snapshot:
+            with self._frame_lock:
+                self._snap_bgr = bgr.copy()
+                self._snap_conf = snap_conf
+                self._snap_corners = snap_corners
 
         row = np.ascontiguousarray(row, dtype=np.float32)
         out_msg = self._bridge.cv2_to_imgmsg(row, encoding='32FC1')
         out_msg.header = msg.header
-        self._pub.publish(out_msg)
+        try:
+            self._pub.publish(out_msg)
+        except Exception:
+            if rclpy.ok():
+                raise
+
+
+def _sanitize_ros_args_for_rcl(argv: list[str] | None) -> list[str] | None:
+    """Drop ``-p`` / ``--param`` overrides with an empty value (``name:=``). rcl rejects those."""
+    if argv is None:
+        return None
+    out: list[str] = []
+    i = 0
+    n = len(argv)
+    while i < n:
+        tok = argv[i]
+        # Glued form, e.g. ``-pmodel_path:=`` (invalid) or ``-pmodel_path:=/path`` (ok).
+        if tok.startswith('-p') and tok not in ('-p', '--param') and ':=' in tok:
+            body = tok[2:]
+            _, _, rhs = body.partition(':=')
+            if rhs == '':
+                i += 1
+                continue
+            out.append(tok)
+            i += 1
+            continue
+        if tok in ('-p', '--param') and i + 1 < n:
+            spec = argv[i + 1]
+            if ':=' in spec:
+                _, _, rhs = spec.partition(':=')
+                if rhs == '':
+                    i += 2
+                    continue
+            out.append(tok)
+            out.append(argv[i + 1])
+            i += 2
+            continue
+        out.append(tok)
+        i += 1
+    return out
 
 
 def main(args: Any = None) -> None:
-    rclpy.init(args=args)
+    init_argv = list(sys.argv) if args is None else list(args)
+    rclpy.init(args=_sanitize_ros_args_for_rcl(init_argv))
     node: BeanBagNnDetector | None = None
     try:
         node = BeanBagNnDetector()
@@ -271,8 +534,15 @@ def main(args: Any = None) -> None:
         pass
     finally:
         if node is not None:
-            node.destroy_node()
-        rclpy.shutdown()
+            try:
+                node.destroy_node()
+            except Exception:
+                pass
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

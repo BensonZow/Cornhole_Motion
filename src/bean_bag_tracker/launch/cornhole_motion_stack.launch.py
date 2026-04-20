@@ -82,6 +82,7 @@ def generate_launch_description() -> LaunchDescription:
         executable='bean_bag_nn_detector',
         name='bean_bag_nn_detector',
         output='screen',
+        prefix=['xterm -e'],
         parameters=[
             {
                 'detection_topic': '/bean_bag_detection',
@@ -98,6 +99,7 @@ def generate_launch_description() -> LaunchDescription:
         executable='ros2_bag_sense_fast',
         name='ros2_bag_sense_fast',
         output='screen',
+        prefix=['xterm -e'],
         parameters=[
             {
                 'bag_detection_topic': '/bean_bag_detection',
@@ -113,6 +115,7 @@ def generate_launch_description() -> LaunchDescription:
         executable='ros2_bag_sense_manual_depth',
         name='ros2_bag_sense_manual_depth',
         output='screen',
+        prefix=['xterm -e'],
         parameters=[
             {
                 'min_z_meters': 0.2,
@@ -127,6 +130,7 @@ def generate_launch_description() -> LaunchDescription:
         executable='omni_pwm_subscribe',
         name='omni_pwm_subscribe',
         output='screen',
+        prefix=['xterm -e'],
     )
 
     return LaunchDescription(
