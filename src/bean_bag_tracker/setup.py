@@ -38,6 +38,7 @@ setup(
             'bean_bag_nn_detector = bean_bag_tracker.bean_bag_nn_detector:main',
             'realsense_preview_to_file = bean_bag_tracker.realsense_preview_to_file:main',
             'train_unlabelled_capture = bean_bag_tracker.train_unlabelled_capture:main',
+            'tracker_node = bean_bag_tracker.tracker_node:main'
         ],
     },
 )

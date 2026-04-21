@@ -75,7 +75,21 @@ except Exception:
 
 from cv_bridge import CvBridge
 from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 from sensor_msgs.msg import Image
+
+# BEST_EFFORT like RealSense; depth 10 matches prior default publisher queue size.
+_NN_IMAGE_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=10,
+    durability=DurabilityPolicy.VOLATILE,
+)
 
 
 def _scalar_float(name: str, val: Any) -> float:
@@ -192,6 +206,8 @@ class BeanBagNnDetector(Node):
         self.declare_parameter('stream_snapshot_min_interval_sec', 0.0)
         self.declare_parameter('stream_snapshot_output_dir', '')
         self.declare_parameter('stream_write_queue_size', 8)
+        # <=0 disables periodic stdout timing (ms per pipeline stage + bag-detection publish Hz).
+        self.declare_parameter('timing_stats_interval_sec', 1.0)
 
         self._bridge = CvBridge()
         self._conf_thr = _scalar_float('confidence_threshold', self.get_parameter('confidence_threshold').value)
@@ -206,6 +222,18 @@ class BeanBagNnDetector(Node):
         else:
             self._class_ids = [int(raw_classes)]
         self._last_infer_mono = 0.0
+
+        self._timing_interval = _scalar_float(
+            'timing_stats_interval_sec',
+            self.get_parameter('timing_stats_interval_sec').value,
+        )
+        self._timing_last_print_mono = time.monotonic()
+        self._timing_frame_count = 0
+        self._timing_pub_count = 0
+        self._timing_sum_decode = 0.0
+        self._timing_sum_infer = 0.0
+        self._timing_sum_post = 0.0
+        self._timing_sum_pub = 0.0
 
         self._snapshot_dir = os.path.expanduser(str(self.get_parameter('snapshot_output_dir').value).strip())
         self._enable_y_snapshot = bool(self.get_parameter('enable_y_snapshot').value)
@@ -264,15 +292,24 @@ class BeanBagNnDetector(Node):
                 )
             raise
         self.get_logger().info(f'Loaded YOLO weights from {model_path!r} (device={self._device!r})')
+        if self._timing_interval > 0.0:
+            self.get_logger().info(
+                f'Stdout timing every {self._timing_interval:g}s: DECODE/INFER/POSTPROCESS/PUBLISH (ms) '
+                f'and publish_hz for {self.get_parameter("detection_topic").value!r}. '
+                'Set timing_stats_interval_sec:=0 to disable.',
+            )
 
         self._pub = self.create_publisher(
-            Image, self.get_parameter('detection_topic').value, 10
+            Image,
+            self.get_parameter('detection_topic').value,
+            qos_profile=_NN_IMAGE_QOS,
         )
+        # BEST_EFFORT matches RealSense ``image_raw``; avoids RELIABLE backlog vs a fast camera.
         self.create_subscription(
             Image,
             self.get_parameter('color_topic').value,
             self._color_cb,
-            10,
+            qos_profile=_NN_IMAGE_QOS,
         )
 
         if self._enable_y_snapshot:
@@ -369,7 +406,7 @@ class BeanBagNnDetector(Node):
                 return
             if line.strip().casefold() != 'y':
                 continue
-            self._save_y_snapshot()
+            #TODO: Debug image save self._save_y_snapshot()
 
     def _save_y_snapshot(self) -> None:
         out_dir = self._snapshot_dir
@@ -403,6 +440,54 @@ class BeanBagNnDetector(Node):
 
         return get_package_share_directory('bean_bag_tracker')
 
+    def _timing_accum_and_maybe_print(
+        self,
+        decode_ms: float,
+        infer_ms: float,
+        post_ms: float,
+        pub_ms: float,
+    ) -> None:
+        """Stdout: rolling averages and publish rate for ``detection_topic``."""
+        if self._timing_interval <= 0.0:
+            return
+        self._timing_frame_count += 1
+        self._timing_pub_count += 1
+        self._timing_sum_decode += decode_ms
+        self._timing_sum_infer += infer_ms
+        self._timing_sum_post += post_ms
+        self._timing_sum_pub += pub_ms
+        now = time.monotonic()
+        wall_s = now - self._timing_last_print_mono
+        if wall_s < self._timing_interval:
+            return
+        n = self._timing_frame_count
+        topic = self.get_parameter('detection_topic').value
+        hz = self._timing_pub_count / wall_s if wall_s > 0.0 else 0.0
+        if n > 0:
+            ad = self._timing_sum_decode / n
+            ai = self._timing_sum_infer / n
+            ap = self._timing_sum_post / n
+            ab = self._timing_sum_pub / n
+        else:
+            ad = ai = ap = ab = 0.0
+        sys.stdout.write(
+            '[bean_bag_nn_detector timing] '
+            f'window={wall_s * 1000.0:.0f}ms frames={n} publishes={self._timing_pub_count} '
+            f'→ {topic!r} publish_hz={hz:.2f}\n'
+            '  state avg_ms (this window): '
+            f'DECODE={ad:.2f} INFER={ai:.2f} POSTPROCESS={ap:.2f} PUBLISH={ab:.2f}\n'
+            '  state last_ms (final frame): '
+            f'DECODE={decode_ms:.2f} INFER={infer_ms:.2f} POSTPROCESS={post_ms:.2f} PUBLISH={pub_ms:.2f}\n'
+        )
+        sys.stdout.flush()
+        self._timing_last_print_mono = now
+        self._timing_frame_count = 0
+        self._timing_pub_count = 0
+        self._timing_sum_decode = 0.0
+        self._timing_sum_infer = 0.0
+        self._timing_sum_post = 0.0
+        self._timing_sum_pub = 0.0
+
     def _color_cb(self, msg: Image) -> None:
         if not rclpy.ok():
             return
@@ -413,6 +498,7 @@ class BeanBagNnDetector(Node):
                 return
             self._last_infer_mono = now
 
+        t_decode0 = time.perf_counter()
         bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         h0, w0 = bgr.shape[:2]
 
@@ -426,9 +512,12 @@ class BeanBagNnDetector(Node):
             'device': self._device,
             'verbose': False,
             'half': False,
+            # Single cornhole bag → less NMS work; does not change stamp behavior.
+            'max_det': 1,
         }
         if self._class_ids:
             kwargs['classes'] = self._class_ids
+        t_infer0 = time.perf_counter()
 
         try:
             results = self._model.predict(**kwargs)
@@ -442,6 +531,7 @@ class BeanBagNnDetector(Node):
                     'Train or export with Ultralytics and use that ``.pt``.'
                 )
             raise
+        t_post0 = time.perf_counter()
         row = np.zeros((1, 9), dtype=np.float32)
         snap_conf = 0.0
         snap_corners: np.ndarray | None = None
@@ -474,6 +564,7 @@ class BeanBagNnDetector(Node):
                 self._snap_conf = snap_conf
                 self._snap_corners = snap_corners
 
+        t_pub0 = time.perf_counter()
         row = np.ascontiguousarray(row, dtype=np.float32)
         out_msg = self._bridge.cv2_to_imgmsg(row, encoding='32FC1')
         out_msg.header = msg.header
@@ -482,6 +573,12 @@ class BeanBagNnDetector(Node):
         except Exception:
             if rclpy.ok():
                 raise
+        t_end = time.perf_counter()
+        decode_ms = (t_infer0 - t_decode0) * 1000.0
+        infer_ms = (t_post0 - t_infer0) * 1000.0
+        post_ms = (t_pub0 - t_post0) * 1000.0
+        pub_ms = (t_end - t_pub0) * 1000.0
+        self._timing_accum_and_maybe_print(decode_ms, infer_ms, post_ms, pub_ms)
 
 
 def _sanitize_ros_args_for_rcl(argv: list[str] | None) -> list[str] | None:

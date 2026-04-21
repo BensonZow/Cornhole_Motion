@@ -18,7 +18,7 @@ from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Float32MultiArray
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
-from rclpy.qos import qos_profile_best_available, qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 
 from bean_bag_tracker.trajectory_common import compute_and_publish_points
@@ -74,8 +74,11 @@ class BeanBagTracker(Node):
         self.declare_parameter('max_publish_distance_m', 0.5)
         self.declare_parameter('bag_detection_topic', '/bean_bag_detection')
         self.declare_parameter('min_z_meters', 0.2)
-        # Depth frames often lag color by >100 ms on RealSense USB; 0.1 s was too tight (sync never fired).
-        self.declare_parameter('sync_slop_sec', 0.5)
+        # Depth frames often lag color on RealSense USB; keep generous so depth_ring can match.
+        self.declare_parameter('sync_slop_sec', 1.0)
+        # Slow NN can publish detections long after the color frame; keep enough stamps so pairs are not evicted.
+        self.declare_parameter('stamp_cache_max', 400)
+        self.declare_parameter('depth_ring_max', 400)
         self.declare_parameter('debug_ingest', False)
         self.declare_parameter('debug_ingest_period_sec', 0.5)
         # Save color PNG with box + centroid + depth whenever a synced NN detection has a box.
@@ -90,6 +93,8 @@ class BeanBagTracker(Node):
         self.max_z_meters = float(self.get_parameter('max_z_meters').value)
         self._sync_slop_sec = max(0.05, float(self.get_parameter('sync_slop_sec').value))
         self._sync_slop_ns = int(self._sync_slop_sec * 1e9)
+        self._stamp_cache_max = max(32, int(self.get_parameter('stamp_cache_max').value))
+        self._depth_ring_max = max(60, int(self.get_parameter('depth_ring_max').value))
         self._debug_ingest = bool(self.get_parameter('debug_ingest').value)
         self._debug_ingest_period = max(0.05, float(self.get_parameter('debug_ingest_period_sec').value))
         self._centroid_png_enabled = bool(self.get_parameter('centroid_png_enabled').value)
@@ -147,7 +152,7 @@ class BeanBagTracker(Node):
         self._soft_sync_lock = threading.Lock()
         self._color_by_ns: dict[int, Image] = {}
         self._det_by_ns: dict[int, Image] = {}
-        self._depth_ring: deque[tuple[int, Image]] = deque(maxlen=120)
+        self._depth_ring: deque[tuple[int, Image]] = deque(maxlen=self._depth_ring_max)
         self._soft_emit_ok: set[int] = set()
         self._rx_color = 0
         self._rx_depth = 0
@@ -183,12 +188,12 @@ class BeanBagTracker(Node):
                                                  self.camera_info_callback,
                                                  1)
 
-        # ``qos_profile_best_available`` matches RELIABLE NN output and avoids silent non-matching QoS.
+        # Match ``bean_bag_nn_detector`` publisher (sensor_data / BEST_EFFORT like RealSense color).
         self.create_subscription(
             Image,
             bt,
             self._on_det_soft,
-            qos_profile_best_available,
+            qos_profile=qos_profile_sensor_data,
             callback_group=self.callback_group,
         )
 
@@ -221,8 +226,8 @@ class BeanBagTracker(Node):
             f'(1×9 float32 Image, depth match slop sync_slop_sec={self._sync_slop_sec:g})'
         )
         self.get_logger().info(
-            'Color + depth: qos_profile_sensor_data. bag_detection: qos_profile_best_available '
-            '(matches NN publisher). Triples: color stamp == det stamp + nearest depth within slop.',
+            'Color + depth + bag_detection: qos_profile_sensor_data (BEST_EFFORT). '
+            'Triples: color stamp == det stamp + nearest depth within sync_slop_sec.',
         )
         if self._debug_ingest:
             self.get_logger().info(
@@ -255,10 +260,11 @@ class BeanBagTracker(Node):
             self._zero_sync_warned = True
             self.get_logger().warn(
                 'Still no aligned color+depth+det frames by ~6s (ingest_callbacks=0). '
-                'Check: (1) realsense2_camera + bean_bag_nn_detector running; '
-                '(2) topic names; (3) increase sync_slop_sec; '
-                f'(4) publisher counts color={pc} depth={pd} bag_detection={pb}; '
-                f'(5) messages received color={rxc} depth={rxd} det={rxf}.',
+                'Check: (1) start bean_bag_nn_detector before (or with) this node so /bean_bag_detection '
+                'has a publisher; (2) realsense2_camera running; (3) topic names; '
+                '(4) increase sync_slop_sec / stamp_cache_max if NN is slower than color FPS; '
+                f'(5) publisher counts color={pc} depth={pd} bag_detection={pb}; '
+                f'(6) messages received color={rxc} depth={rxd} det={rxf}.',
             )
 
     def _debug_ingest_timer_callback(self) -> None:
@@ -327,8 +333,10 @@ class BeanBagTracker(Node):
             if t_ns in self._soft_emit_ok:
                 return
             self._soft_emit_ok.add(t_ns)
-            if len(self._soft_emit_ok) > 320:
-                for k in sorted(self._soft_emit_ok)[:160]:
+            _emit_trim_hi = max(320, self._stamp_cache_max * 2)
+            _emit_trim_lo = max(160, self._stamp_cache_max)
+            while len(self._soft_emit_ok) > _emit_trim_hi:
+                for k in sorted(self._soft_emit_ok)[:_emit_trim_lo]:
                     self._soft_emit_ok.discard(k)
             bundle = (c, d, n)
         self._image_sync_callback(bundle[0], bundle[1], bundle[2])
@@ -338,7 +346,7 @@ class BeanBagTracker(Node):
         with self._soft_sync_lock:
             self._rx_color += 1
             self._color_by_ns[ns] = msg
-            self._trim_stamp_dict(self._color_by_ns, 100)
+            self._trim_stamp_dict(self._color_by_ns, self._stamp_cache_max)
         self._try_soft_emit(ns)
 
     def _on_depth_soft(self, msg: Image) -> None:
@@ -347,7 +355,7 @@ class BeanBagTracker(Node):
             self._rx_depth += 1
             ns = Time.from_msg(msg.header.stamp).nanoseconds
             self._depth_ring.append((ns, msg))
-            pending = sorted(self._det_by_ns.keys())[-40:]
+            pending = sorted(self._det_by_ns.keys())[-min(160, self._stamp_cache_max):]
         for t in pending:
             self._try_soft_emit(t)
 
@@ -356,7 +364,7 @@ class BeanBagTracker(Node):
         with self._soft_sync_lock:
             self._rx_det += 1
             self._det_by_ns[ns] = msg
-            self._trim_stamp_dict(self._det_by_ns, 100)
+            self._trim_stamp_dict(self._det_by_ns, self._stamp_cache_max)
         self._try_soft_emit(ns)
 
     def _decode_bag_detection_image(self, det_msg: Image) -> tuple[float, np.ndarray | None]:
