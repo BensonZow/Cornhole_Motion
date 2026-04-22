@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Red Ball Tracking and Horizontal Strafing System with PID Control (ROS2 Subscriber)
+Red Ball Tracking and Horizontal Offset Publisher (ROS2)
 For Raspberry Pi 5 with ROS2 Jazzy and Intel RealSense D415
 Subscribes to existing RealSense ROS2 node for camera feed.
-Uses color detection (red/purple) and serial motor commands.
+Uses color detection (red/purple) and publishes:
+    - absolute horizontal distance from center (non‑negative)
+    - radians: 0.0 (left side) or π (right side)
+Publishes as std_msgs/Float32MultiArray to 'bean_bag_tracker'.
 """
 
 import cv2
@@ -14,12 +17,12 @@ from collections import deque
 from dataclasses import dataclass
 import math
 from typing import Optional, Tuple
-import serial
 
 # ROS2 imports
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
+from std_msgs.msg import Float32MultiArray
 from cv_bridge import CvBridge
 
 # Configuration
@@ -31,7 +34,10 @@ class Config:
     FPS = 30
 
     # ROS2 topic for RealSense color image
-    CAMERA_TOPIC = '/camera/color/image_raw'  # Adjust to your actual topic
+    CAMERA_TOPIC = '/camera/camera/color/image_raw'  # Adjust to your actual topic
+
+    # ROS2 topic for publishing offset data
+    OUTPUT_TOPIC = 'bean_bag_tracker'
 
     # Red color detection (HSV ranges)
     RED_LOWER_1 = np.array([0, 120, 70])
@@ -45,21 +51,8 @@ class Config:
 
     # Ball detection
     MIN_RADIUS = 10
-    MAX_RADIUS = 100
+    MAX_RADIUS = 10000
     MIN_AREA = 100
-
-    # PID Controller gains (X-axis only)
-    KP_X = 0.8
-    KI_X = 0.05
-    KD_X = 0.15
-
-    # Motor control (serial)
-    SERIAL_PORT = '/dev/ttyACM1'
-    SERIAL_BAUD = 115200
-
-    # Motor limits
-    MAX_MOTOR_SPEED = 100
-    MIN_MOTOR_SPEED = 20
 
     # System parameters
     TARGET_X = CAMERA_WIDTH // 2
@@ -72,94 +65,10 @@ class Config:
     SHOW_VIDEO = True
     PRINT_STATS = True
 
-class PIDController:
-    """PID Controller for motor position control"""
-
-    def __init__(self, kp, ki, kd, setpoint=0, output_limits=(-100, 100)):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.setpoint = setpoint
-        self.output_limits = output_limits
-        self.reset()
-
-    def reset(self):
-        self.integral = 0
-        self.previous_error = 0
-        self.previous_time = time.time()
-
-    def calculate(self, measurement: float, dt: Optional[float] = None) -> float:
-        current_time = time.time()
-        if dt is None:
-            dt = current_time - self.previous_time
-            if dt <= 0:
-                dt = 0.01
-
-        error = self.setpoint - measurement
-        p_term = self.kp * error
-        self.integral += error * dt
-        i_term = self.ki * self.integral
-        if dt > 0:
-            d_term = self.kd * (error - self.previous_error) / dt
-        else:
-            d_term = 0
-
-        output = p_term + i_term + d_term
-        output = max(self.output_limits[0], min(self.output_limits[1], output))
-
-        self.previous_error = error
-        self.previous_time = current_time
-        return output
-
-class MotorController:
-    """Motor Controller via Serial to Arduino"""
-
-    def __init__(self, config):
-        self.config = config
-        self.serial_port = None
-        self.initialized = False
-
-        try:
-            self.serial_port = serial.Serial(
-                port=self.config.SERIAL_PORT,
-                baudrate=self.config.SERIAL_BAUD,
-                timeout=1
-            )
-            self.initialized = True
-            print(f"Serial port {self.config.SERIAL_PORT} opened at {self.config.SERIAL_BAUD} baud")
-        except Exception as e:
-            print(f"Error opening serial port: {e}")
-            print("Motor controller in simulation mode (serial output to console)")
-            self.initialized = False
-
-    def set_motor_speeds(self, fl: float, fr: float, rr: float, rl: float):
-        fl = max(-self.config.MAX_MOTOR_SPEED, min(self.config.MAX_MOTOR_SPEED, fl))
-        fr = max(-self.config.MAX_MOTOR_SPEED, min(self.config.MAX_MOTOR_SPEED, fr))
-        rr = max(-self.config.MAX_MOTOR_SPEED, min(self.config.MAX_MOTOR_SPEED, rr))
-        rl = max(-self.config.MAX_MOTOR_SPEED, min(self.config.MAX_MOTOR_SPEED, rl))
-
-        cmd_str = f"{fl:.0f},{fr:.0f},{rr:.0f},{rl:.0f}\n"
-
-        if self.initialized and self.serial_port:
-            try:
-                self.serial_port.write(cmd_str.encode())
-                self.serial_port.flush()
-            except Exception as e:
-                print(f"Serial write error: {e}")
-        else:
-            print(f"Motors: FL={fl:.0f}, FR={fr:.0f}, RR={rr:.0f}, RL={rl:.0f}")
-
-    def stop_all(self):
-        self.set_motor_speeds(0, 0, 0, 0)
-
-    def cleanup(self):
-        if self.initialized and self.serial_port:
-            self.serial_port.close()
-            print("Serial port closed")
-
 class BallTrackerNode(Node):
     """
     ROS2 Node that subscribes to RealSense camera topic and performs color-based ball tracking.
+    Publishes horizontal offset and direction flag.
     """
 
     def __init__(self, config):
@@ -178,6 +87,10 @@ class BallTrackerNode(Node):
             10
         )
         self.get_logger().info(f"Subscribed to {self.config.CAMERA_TOPIC}")
+
+        # Create publisher for offset data
+        self.publisher = self.create_publisher(Float32MultiArray, self.config.OUTPUT_TOPIC, 10)
+        self.get_logger().info(f"Publishing to {self.config.OUTPUT_TOPIC}")
 
         # Position tracking
         self.positions = deque(maxlen=config.SMOOTHING_WINDOW)
@@ -324,7 +237,7 @@ class BallTrackerNode(Node):
         return frame
 
     def process_frame(self, frame):
-        """Process a single frame and return detection result."""
+        """Process a single frame and return detection result and annotated frame."""
         ball_data, mask = self.detect_ball(frame)
         pred_x = pred_y = radius = None
         annotated_frame = frame.copy() if frame is not None else None
@@ -353,8 +266,8 @@ class BallTrackerNode(Node):
     def stop(self):
         self.running = False
 
-class BallCatchingSystem:
-    """Main system for horizontal strafing using color detection from ROS2."""
+class BallTrackerSystem:
+    """Main system for tracking balls and publishing offset data."""
 
     def __init__(self):
         self.config = Config()
@@ -363,39 +276,35 @@ class BallCatchingSystem:
         rclpy.init()
         self.tracker_node = BallTrackerNode(self.config)
 
-        self.motor_controller = MotorController(self.config)
-
-        self.pid_x = PIDController(
-            kp=self.config.KP_X,
-            ki=self.config.KI_X,
-            kd=self.config.KD_X,
-            setpoint=self.config.TARGET_X,
-            output_limits=(-self.config.MAX_MOTOR_SPEED, self.config.MAX_MOTOR_SPEED)
-        )
-
+        # State
         self.running = True
-        self.movement_enabled = False  # Start in pause mode
+        self.publish_enabled = False  # Start in pause mode
         self.ball_detected = False
 
         self.frame_count = 0
         self.detection_count = 0
         self.start_time = time.time()
 
-    def calculate_motor_speeds(self, ball_x: float) -> Tuple[float, float, float, float]:
-        speed = self.pid_x.calculate(ball_x)
-        if abs(speed) > 0 and abs(speed) < self.config.MIN_MOTOR_SPEED:
-            speed = self.config.MIN_MOTOR_SPEED if speed > 0 else -self.config.MIN_MOTOR_SPEED
-        return speed, speed, speed, speed
+    def calculate_offset_data(self, ball_x: float) -> Tuple[float, float]:
+        """
+        Compute absolute horizontal distance from center and radians direction flag.
+        Returns (distance, radians) where radians is 0.0 for left, π for right.
+        """
+        distance = abs(ball_x - self.config.TARGET_X)
+        if ball_x < self.config.TARGET_X:
+            radians = 0.0       # left side
+        else:
+            radians = math.pi   # right side
+        return distance, radians
 
     def run(self):
-        print("Starting ROS2 color-based horizontal strafing system...")
+        print("Starting ROS2 color-based tracking system (offset publisher)...")
         print("Controls:")
-        print("  ENTER : Start movement (run mode)")
-        print("  SPACE : Pause movement")
+        print("  ENTER : Start publishing")
+        print("  SPACE : Pause publishing")
         print("  'q'   : Quit")
-        print("  'r'   : Reset PID")
-        print("  's'   : Stop motors (also pauses)")
-        print("System starts in PAUSE mode. Press ENTER to begin moving.")
+        print("  's'   : Stop publishing (same as pause)")
+        print("System starts in PAUSE mode. Press ENTER to begin publishing.")
 
         last_print_time = time.time()
 
@@ -421,11 +330,14 @@ class BallCatchingSystem:
                     self.detection_count += 1
                     self.ball_detected = True
 
-                    if self.movement_enabled:
-                        fl, fr, rr, rl = self.calculate_motor_speeds(float(ball_x))
-                        self.motor_controller.set_motor_speeds(fl, fr, rr, rl)
-                    else:
-                        self.motor_controller.stop_all()
+                    # Calculate offset data
+                    distance, radians = self.calculate_offset_data(float(ball_x))
+
+                    if self.publish_enabled:
+                        # Publish as Float32MultiArray
+                        msg = Float32MultiArray()
+                        msg.data = [distance, radians]
+                        self.tracker_node.publisher.publish(msg)
 
                     # Stats print
                     current_time = time.time()
@@ -433,19 +345,19 @@ class BallCatchingSystem:
                         elapsed = current_time - self.start_time
                         fps = self.frame_count / elapsed if elapsed > 0 else 0
                         detect_rate = (self.detection_count / self.frame_count) * 100 if self.frame_count > 0 else 0
-                        mode_str = "RUN" if self.movement_enabled else "PAUSE"
-                        print(f"[{mode_str}] FPS: {fps:.1f}, Ball X: {int(ball_x)}, "
-                              f"Radius: {radius}, Detect: {detect_rate:.1f}%")
+                        mode_str = "PUBLISH" if self.publish_enabled else "PAUSE"
+                        side_str = "LEFT" if ball_x < self.config.TARGET_X else "RIGHT"
+                        print(f"[{mode_str}] FPS: {fps:.1f}, Ball X: {int(ball_x)} ({side_str}), "
+                              f"Dist: {distance:.1f}, Rad: {radians:.2f}, Detect: {detect_rate:.1f}%")
                         last_print_time = current_time
                 else:
                     self.ball_detected = False
-                    self.motor_controller.stop_all()
 
                 # Display
                 if self.config.SHOW_VIDEO and annotated_frame is not None:
                     # Show mode status
-                    mode_text = "MODE: RUN" if self.movement_enabled else "MODE: PAUSE (Press ENTER to start)"
-                    mode_color = (0, 255, 0) if self.movement_enabled else (0, 0, 255)
+                    mode_text = "MODE: PUBLISH" if self.publish_enabled else "MODE: PAUSE (Press ENTER to start)"
+                    mode_color = (0, 255, 0) if self.publish_enabled else (0, 0, 255)
                     cv2.putText(annotated_frame, mode_text, (10, 120),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, mode_color, 2)
 
@@ -455,31 +367,31 @@ class BallCatchingSystem:
                     cv2.putText(annotated_frame, f"Status: {status}", (10, 150),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
 
+                    if self.ball_detected and ball_x is not None:
+                        distance, radians = self.calculate_offset_data(float(ball_x))
+                        cv2.putText(annotated_frame, f"Dist: {distance:.1f} px, Rad: {radians:.2f}", (10, 180),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
                     # FPS
                     frame_time = time.time() - frame_start_time
                     fps_disp = 1.0 / frame_time if frame_time > 0 else 0
-                    cv2.putText(annotated_frame, f"FPS: {fps_disp:.1f}", (10, 180),
+                    cv2.putText(annotated_frame, f"FPS: {fps_disp:.1f}", (10, 210),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-                    cv2.imshow("Ball Tracker - Horizontal Strafing (ROS2)", annotated_frame)
+                    cv2.imshow("Ball Tracker - Offset Publisher (ROS2)", annotated_frame)
 
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord('q'):
                         break
-                    elif key == ord('r'):
-                        self.pid_x.reset()
-                        print("PID controller reset")
                     elif key == ord('s'):
-                        self.motor_controller.stop_all()
-                        self.movement_enabled = False
-                        print("Motors stopped, movement paused")
+                        self.publish_enabled = False
+                        print("Publishing paused")
                     elif key == 13 or key == 10:  # Enter key
-                        self.movement_enabled = True
-                        print("Movement ENABLED (RUN mode)")
+                        self.publish_enabled = True
+                        print("Publishing ENABLED")
                     elif key == 32:  # Space key
-                        self.movement_enabled = False
-                        self.motor_controller.stop_all()
-                        print("Movement PAUSED")
+                        self.publish_enabled = False
+                        print("Publishing PAUSED")
 
                 # Maintain approximate frame rate
                 frame_end_time = time.time()
@@ -501,8 +413,6 @@ class BallCatchingSystem:
         print("\nCleaning up...")
         self.running = False
         self.tracker_node.stop()
-        self.motor_controller.stop_all()
-        self.motor_controller.cleanup()
         cv2.destroyAllWindows()
         if rclpy.ok():
             rclpy.shutdown()
@@ -519,20 +429,20 @@ class BallCatchingSystem:
                 print(f"Detection rate: {(self.detection_count/self.frame_count)*100:.1f}%")
 
 def main():
-    system = BallCatchingSystem()
+    system = BallTrackerSystem()
 
     print("=" * 60)
-    print("RED BALL HORIZONTAL STRAFING SYSTEM (ROS2)")
+    print("RED BALL OFFSET PUBLISHER (ROS2)")
     print("Subscribing to RealSense camera topic")
     print("=" * 60)
-    print(f"ROS2 Topic: {system.config.CAMERA_TOPIC}")
+    print(f"ROS2 Input Topic:  {system.config.CAMERA_TOPIC}")
+    print(f"ROS2 Output Topic: {system.config.OUTPUT_TOPIC}")
     print(f"Camera: {system.config.CAMERA_WIDTH}x{system.config.CAMERA_HEIGHT} @ {system.config.FPS}FPS")
     print(f"Target X: {system.config.TARGET_X}")
-    print(f"PID Gains: KP={system.config.KP_X}, KI={system.config.KI_X}, KD={system.config.KD_X}")
-    print(f"Serial: {system.config.SERIAL_PORT} @ {system.config.SERIAL_BAUD} baud")
     print("=" * 60)
+    print("Publishes: [distance_from_center (px), radians (0.0 left, π right)]")
     print("System starts in PAUSE mode.")
-    print("Press ENTER to start movement, SPACE to pause.")
+    print("Press ENTER to start publishing, SPACE to pause.")
     print("=" * 60)
 
     system.run()
