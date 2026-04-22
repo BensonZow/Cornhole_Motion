@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 YOLO Object Detection Based Horizontal Strafing System with PID Control
-For Raspberry Pi 5 with Intel RealSense D415 and ROS2 Jazzy
-Uses Ultralytics YOLO for object detection, pyserial for motor commands to Arduino
+For Raspberry Pi 5 with ROS2 Jazzy and Intel RealSense D415
+Subscribes to existing RealSense ROS2 node for camera feed.
+Uses Ultralytics YOLO for object detection, pyserial for motor commands.
 """
 
 import cv2
@@ -15,6 +16,12 @@ import math
 from typing import Optional, Tuple
 import serial
 
+# ROS2 imports
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+
 # Ultralytics YOLO
 try:
     from ultralytics import YOLO
@@ -22,14 +29,6 @@ try:
 except ImportError:
     ULTRALYTICS_AVAILABLE = False
     print("Warning: ultralytics not available. Please install: pip install ultralytics")
-
-# RealSense
-try:
-    import pyrealsense2 as rs
-    REALSENSE_AVAILABLE = True
-except ImportError:
-    REALSENSE_AVAILABLE = False
-    print("Warning: pyrealsense2 not available, using OpenCV fallback")
 
 # Configuration
 @dataclass
@@ -39,10 +38,12 @@ class Config:
     CAMERA_HEIGHT = 480
     FPS = 30
 
+    # ROS2 topic for RealSense color image
+    CAMERA_TOPIC = '/camera/color/image_raw'  # Adjust to your actual topic
+
     # YOLO model settings
-    # CHANGE THIS PATH TO YOUR TRAINED MODEL FILE
     YOLO_MODEL_PATH = "path/to/your/model.pt"  # <--- PUT YOUR .pt FILE NAME HERE
-    CONFIDENCE_THRESHOLD = 0.4                 # Minimum confidence to consider a detection
+    CONFIDENCE_THRESHOLD = 0.4
 
     # PID Controller gains (X-axis only)
     KP_X = 0.8
@@ -50,7 +51,7 @@ class Config:
     KD_X = 0.15
 
     # Motor control (serial)
-    SERIAL_PORT = '/dev/ttyACM0'
+    SERIAL_PORT = '/dev/ttyUSB0'
     SERIAL_BAUD = 115200
 
     # Motor limits
@@ -58,7 +59,7 @@ class Config:
     MIN_MOTOR_SPEED = 20
 
     # System parameters
-    TARGET_X = CAMERA_WIDTH // 2               # Center of frame
+    TARGET_X = CAMERA_WIDTH // 2
 
     # Prediction settings
     PREDICTION_WINDOW = 5
@@ -153,77 +154,63 @@ class MotorController:
             self.serial_port.close()
             print("Serial port closed")
 
-class YOLOTracker:
-    """Tracks objects using YOLO model (e.g., red/purple balls)"""
+class YOLOTrackerNode(Node):
+    """
+    ROS2 Node that subscribes to RealSense camera topic and performs YOLO tracking.
+    """
 
     def __init__(self, config):
+        super().__init__('yolo_tracker_node')
         self.config = config
-        self.pipeline = None
-        self.align = None
-        self.running = False
-        self.frame = None
-        self.lock = threading.Lock()
+        self.bridge = CvBridge()
+        self.latest_frame = None
+        self.frame_lock = threading.Lock()
+        self.new_frame_event = threading.Event()
 
         # Load YOLO model
         self.model = None
         if ULTRALYTICS_AVAILABLE:
             try:
                 self.model = YOLO(config.YOLO_MODEL_PATH)
-                print(f"YOLO model loaded from {config.YOLO_MODEL_PATH}")
+                self.get_logger().info(f"YOLO model loaded from {config.YOLO_MODEL_PATH}")
             except Exception as e:
-                print(f"Error loading YOLO model: {e}")
-                self.model = None
+                self.get_logger().error(f"Error loading YOLO model: {e}")
         else:
-            print("YOLO not available. Detection disabled.")
+            self.get_logger().error("Ultralytics not available. Detection disabled.")
+
+        # Create subscription to RealSense color topic
+        self.subscription = self.create_subscription(
+            Image,
+            self.config.CAMERA_TOPIC,
+            self.image_callback,
+            10
+        )
+        self.get_logger().info(f"Subscribed to {self.config.CAMERA_TOPIC}")
 
         # Position tracking
         self.positions = deque(maxlen=config.SMOOTHING_WINDOW)
         self.velocities = deque(maxlen=config.PREDICTION_WINDOW)
 
-        self._init_camera()
+        # Tracking state
+        self.running = True
 
-    def _init_camera(self):
-        if REALSENSE_AVAILABLE:
-            try:
-                self.pipeline = rs.pipeline()
-                config = rs.config()
-                config.enable_stream(rs.stream.color,
-                                     self.config.CAMERA_WIDTH,
-                                     self.config.CAMERA_HEIGHT,
-                                     rs.format.bgr8,
-                                     self.config.FPS)
-                self.pipeline.start(config)
-                self.align = rs.align(rs.stream.color)
-                print("RealSense D415 initialized successfully")
-                return
-            except Exception as e:
-                print(f"Error initializing RealSense: {e}")
-                self.pipeline = None
+    def image_callback(self, msg):
+        """ROS2 callback for incoming camera images."""
+        try:
+            # Convert ROS Image message to OpenCV BGR format
+            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            with self.frame_lock:
+                self.latest_frame = cv_image
+            self.new_frame_event.set()
+        except Exception as e:
+            self.get_logger().error(f"Error in image callback: {e}")
 
-        print("Using OpenCV camera fallback")
-        self.camera = cv2.VideoCapture(0)
-        if self.camera.isOpened():
-            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.CAMERA_WIDTH)
-            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.CAMERA_HEIGHT)
-            self.camera.set(cv2.CAP_PROP_FPS, self.config.FPS)
-            print("OpenCV camera initialized")
-        else:
-            print("Error: Could not open any camera")
-
-    def get_frame(self):
-        if REALSENSE_AVAILABLE and self.pipeline:
-            try:
-                frames = self.pipeline.wait_for_frames(timeout_ms=1000)
-                color_frame = frames.get_color_frame()
-                if color_frame:
-                    return np.asanyarray(color_frame.get_data())
-            except Exception as e:
-                print(f"RealSense frame error: {e}")
-                return None
-        elif hasattr(self, 'camera') and self.camera.isOpened():
-            ret, frame = self.camera.read()
-            if ret:
-                return frame
+    def get_frame(self, timeout=1.0):
+        """Wait for a new frame and return it."""
+        if self.new_frame_event.wait(timeout=timeout):
+            self.new_frame_event.clear()
+            with self.frame_lock:
+                return self.latest_frame.copy() if self.latest_frame is not None else None
         return None
 
     def detect_object(self, frame):
@@ -266,10 +253,6 @@ class YOLOTracker:
         cx = int((x1 + x2) / 2)
         cy = int((y1 + y2) / 2)
 
-        # Bounding box width and height (for info)
-        w = int(x2 - x1)
-        h = int(y2 - y1)
-
         return (cx, cy, best_conf, (x1, y1, x2, y2))
 
     def predict_position(self, position: Tuple[int, int]) -> Tuple[int, int]:
@@ -308,17 +291,12 @@ class YOLOTracker:
             x1, y1, x2, y2 = bbox
             pred_x, pred_y = pred_position
 
-            # Draw bounding box
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            # Draw centroid
             cv2.circle(frame, (int(cx), int(cy)), 5, (0, 0, 255), -1)
-            # Draw confidence
             cv2.putText(frame, f"{conf:.2f}", (int(x1), int(y1)-5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            # Draw predicted position
             cv2.circle(frame, (int(pred_x), int(pred_y)), 10, (255, 255, 0), 2)
 
-        # Draw target vertical line
         cv2.line(frame, (self.config.TARGET_X, 0),
                  (self.config.TARGET_X, self.config.CAMERA_HEIGHT),
                  (255, 0, 0), 2)
@@ -344,50 +322,41 @@ class YOLOTracker:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         return frame
 
-    def run_tracking(self):
-        """Main tracking loop - returns object centroid and annotated frame."""
-        self.running = True
+    def process_frame(self, frame):
+        """Process a single frame and return detection result."""
+        detection = self.detect_object(frame)
+        pred_x = pred_y = conf = None
+        annotated_frame = frame.copy() if frame is not None else None
 
-        while self.running:
-            frame = self.get_frame()
-            if frame is None:
-                time.sleep(0.01)
-                continue
+        if detection is not None:
+            cx, cy, conf, bbox = detection
+            pred_x, pred_y = self.predict_position((cx, cy))
 
-            with self.lock:
-                self.frame = frame.copy()
+            if self.config.SHOW_VIDEO and annotated_frame is not None:
+                annotated_frame = self.draw_detection(annotated_frame, detection, (pred_x, pred_y))
+                annotated_frame = self.draw_text(annotated_frame, detection, (pred_x, pred_y))
+        else:
+            if self.config.SHOW_VIDEO and annotated_frame is not None:
+                annotated_frame = self.draw_text(annotated_frame, None, (0, 0))
+                cv2.line(annotated_frame, (self.config.TARGET_X, 0),
+                         (self.config.TARGET_X, self.config.CAMERA_HEIGHT),
+                         (255, 0, 0), 2)
 
-            detection = self.detect_object(frame)
-            if detection is not None:
-                cx, cy, conf, bbox = detection
-                pred_x, pred_y = self.predict_position((cx, cy))
-
-                if self.config.SHOW_VIDEO:
-                    frame = self.draw_detection(frame, detection, (pred_x, pred_y))
-                    frame = self.draw_text(frame, detection, (pred_x, pred_y))
-
-                return pred_x, pred_y, conf, frame
-            else:
-                if self.config.SHOW_VIDEO:
-                    frame = self.draw_text(frame, None, (0, 0))
-                    cv2.line(frame, (self.config.TARGET_X, 0),
-                             (self.config.TARGET_X, self.config.CAMERA_HEIGHT),
-                             (255, 0, 0), 2)
-                return None, None, None, frame
+        return pred_x, pred_y, conf, annotated_frame
 
     def stop(self):
         self.running = False
-        if hasattr(self, 'pipeline') and self.pipeline:
-            self.pipeline.stop()
-        if hasattr(self, 'camera') and self.camera.isOpened():
-            self.camera.release()
 
 class StrafingSystem:
-    """Main system for horizontal strafing using YOLO detections"""
+    """Main system for horizontal strafing using YOLO detections from ROS2."""
 
     def __init__(self):
         self.config = Config()
-        self.tracker = YOLOTracker(self.config)
+
+        # Initialize ROS2
+        rclpy.init()
+        self.tracker_node = YOLOTrackerNode(self.config)
+
         self.motor_controller = MotorController(self.config)
 
         self.pid_x = PIDController(
@@ -398,8 +367,8 @@ class StrafingSystem:
             output_limits=(-self.config.MAX_MOTOR_SPEED, self.config.MAX_MOTOR_SPEED)
         )
 
-        self.running = True           # Main loop control
-        self.movement_enabled = False # Pause/run mode (start paused)
+        self.running = True
+        self.movement_enabled = False  # Start in pause mode
         self.object_detected = False
 
         self.frame_count = 0
@@ -413,7 +382,7 @@ class StrafingSystem:
         return speed, speed, speed, speed
 
     def run(self):
-        print("Starting YOLO-based horizontal strafing system...")
+        print("Starting ROS2 YOLO-based horizontal strafing system...")
         print("Controls:")
         print("  ENTER : Start movement (run mode)")
         print("  SPACE : Pause movement")
@@ -425,11 +394,21 @@ class StrafingSystem:
         last_print_time = time.time()
 
         try:
-            while self.running:
+            while self.running and rclpy.ok():
+                # Spin ROS2 once to process callbacks
+                rclpy.spin_once(self.tracker_node, timeout_sec=0.01)
+
                 frame_start_time = time.time()
 
-                # Run detection
-                obj_x, obj_y, conf, frame = self.tracker.run_tracking()
+                # Get latest frame from ROS2 topic
+                frame = self.tracker_node.get_frame(timeout=0.1)
+                if frame is None:
+                    time.sleep(0.01)
+                    continue
+
+                # Process frame through YOLO
+                obj_x, obj_y, conf, annotated_frame = self.tracker_node.process_frame(frame)
+
                 self.frame_count += 1
 
                 if obj_x is not None:
@@ -457,20 +436,20 @@ class StrafingSystem:
                     self.motor_controller.stop_all()
 
                 # Display
-                if self.config.SHOW_VIDEO and frame is not None:
+                if self.config.SHOW_VIDEO and annotated_frame is not None:
                     # Show mode status
                     mode_text = "MODE: RUN" if self.movement_enabled else "MODE: PAUSE (Press ENTER to start)"
                     mode_color = (0, 255, 0) if self.movement_enabled else (0, 0, 255)
-                    cv2.putText(frame, mode_text, (10, 120),
+                    cv2.putText(annotated_frame, mode_text, (10, 120),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, mode_color, 2)
 
                     # FPS
                     frame_time = time.time() - frame_start_time
                     fps_disp = 1.0 / frame_time if frame_time > 0 else 0
-                    cv2.putText(frame, f"FPS: {fps_disp:.1f}", (10, 150),
+                    cv2.putText(annotated_frame, f"FPS: {fps_disp:.1f}", (10, 150),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-                    cv2.imshow("YOLO Tracker - Horizontal Strafing", frame)
+                    cv2.imshow("YOLO Tracker - Horizontal Strafing (ROS2)", annotated_frame)
 
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord('q'):
@@ -490,7 +469,7 @@ class StrafingSystem:
                         self.motor_controller.stop_all()
                         print("Movement PAUSED")
 
-                # Maintain frame rate
+                # Maintain approximate frame rate
                 frame_end_time = time.time()
                 processing_time = frame_end_time - frame_start_time
                 target_time = 1.0 / self.config.FPS
@@ -509,10 +488,12 @@ class StrafingSystem:
     def cleanup(self):
         print("\nCleaning up...")
         self.running = False
-        self.tracker.stop()
+        self.tracker_node.stop()
         self.motor_controller.stop_all()
         self.motor_controller.cleanup()
         cv2.destroyAllWindows()
+        if rclpy.ok():
+            rclpy.shutdown()
 
         if self.config.PRINT_STATS:
             total_time = time.time() - self.start_time
@@ -529,12 +510,12 @@ def main():
     system = StrafingSystem()
 
     print("=" * 60)
-    print("YOLO OBJECT DETECTION STRAFING SYSTEM")
-    print("RealSense D415 + Mecanum Wheels")
+    print("YOLO OBJECT DETECTION STRAFING SYSTEM (ROS2)")
+    print("Subscribing to RealSense camera topic")
     print("=" * 60)
+    print(f"ROS2 Topic: {system.config.CAMERA_TOPIC}")
     print(f"Model: {system.config.YOLO_MODEL_PATH}")
     print(f"Confidence threshold: {system.config.CONFIDENCE_THRESHOLD}")
-    print(f"Camera: {system.config.CAMERA_WIDTH}x{system.config.CAMERA_HEIGHT} @ {system.config.FPS}FPS")
     print(f"Target X: {system.config.TARGET_X}")
     print(f"PID Gains: KP={system.config.KP_X}, KI={system.config.KI_X}, KD={system.config.KD_X}")
     print(f"Serial: {system.config.SERIAL_PORT} @ {system.config.SERIAL_BAUD} baud")
