@@ -634,7 +634,7 @@ class BeanBagNnDetector(Node):
         t_decode0 = time.perf_counter()
         bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         h0, w0 = bgr.shape[:2]
-        stamp_ns = Time.from_msg(msg.header).nanoseconds
+        stamp_ns = Time.from_msg(msg.header.stamp).nanoseconds
 
         if self._segmented_throw_mode:
             with self._seg_lock:
