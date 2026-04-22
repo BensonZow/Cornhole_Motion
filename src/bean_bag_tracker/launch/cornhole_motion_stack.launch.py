@@ -89,6 +89,8 @@ def generate_launch_description() -> LaunchDescription:
                 'model_path': LaunchConfiguration('model_path'),
                 'device': LaunchConfiguration('device'),
                 'confidence_threshold': LaunchConfiguration('confidence_threshold'),
+                'segmented_throw_mode': True,
+                'throw_batch_topic': '/bean_bag_throw_batch',
             }
         ],
         condition=UnlessCondition(LaunchConfiguration('manual_depth_tracker')),
@@ -102,11 +104,10 @@ def generate_launch_description() -> LaunchDescription:
         prefix=['xterm -e'],
         parameters=[
             {
-                'bag_detection_topic': '/bean_bag_detection',
                 'min_z_meters': 0.2,
                 'max_z_meters': 4.0,
-                'throw_silence_timeout_sec': 0.5,
-                'max_throw_buffer_frames': 400,
+                'use_segment_batch_from_nn': True,
+                'throw_batch_topic': '/bean_bag_throw_batch',
             }
         ],
         condition=UnlessCondition(LaunchConfiguration('manual_depth_tracker')),

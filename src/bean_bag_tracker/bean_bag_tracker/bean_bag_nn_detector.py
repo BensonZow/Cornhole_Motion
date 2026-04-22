@@ -75,6 +75,7 @@ except Exception:
 
 from cv_bridge import CvBridge
 from rclpy.node import Node
+from rclpy.time import Time
 from rclpy.qos import (
     DurabilityPolicy,
     HistoryPolicy,
@@ -82,6 +83,9 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 from sensor_msgs.msg import Image
+from std_msgs.msg import Float64MultiArray
+
+from bean_bag_tracker.throw_batch_msg import pack_throw_batch
 
 # BEST_EFFORT like RealSense; depth 10 matches prior default publisher queue size.
 _NN_IMAGE_QOS = QoSProfile(
@@ -208,6 +212,11 @@ class BeanBagNnDetector(Node):
         self.declare_parameter('stream_write_queue_size', 8)
         # <=0 disables periodic stdout timing (ms per pipeline stage + bag-detection publish Hz).
         self.declare_parameter('timing_stats_interval_sec', 1.0)
+        # Keyboard ``b``/``e``+Enter: buffer color frames without inference, then YOLO on middle-3 only.
+        self.declare_parameter('segmented_throw_mode', False)
+        self.declare_parameter('throw_segment_max_frames', 2000)
+        self.declare_parameter('throw_batch_topic', '/bean_bag_throw_batch')
+        self.declare_parameter('debug_throw_pipeline', False)
 
         self._bridge = CvBridge()
         self._conf_thr = _scalar_float('confidence_threshold', self.get_parameter('confidence_threshold').value)
@@ -262,6 +271,15 @@ class BeanBagNnDetector(Node):
         self._snap_conf: float = 0.0
         self._snap_corners: np.ndarray | None = None
 
+        self._segmented_throw_mode = bool(self.get_parameter('segmented_throw_mode').value)
+        self._throw_segment_max_frames = max(3, _scalar_int('throw_segment_max_frames', self.get_parameter('throw_segment_max_frames').value))
+        self._debug_throw_pipeline = bool(self.get_parameter('debug_throw_pipeline').value)
+        self._throw_batch_topic = str(self.get_parameter('throw_batch_topic').value).strip() or '/bean_bag_throw_batch'
+        self._seg_lock = threading.Lock()
+        self._segment_recording = False
+        # (stamp_ns, bgr) while recording a throw
+        self._segment_buffer: list[tuple[int, np.ndarray]] = []
+
         model_path = self.get_parameter('model_path').value
         if not model_path or not str(model_path).strip():
             share = self._package_share_dir()
@@ -304,6 +322,11 @@ class BeanBagNnDetector(Node):
             self.get_parameter('detection_topic').value,
             qos_profile=_NN_IMAGE_QOS,
         )
+        self._pub_throw_batch = self.create_publisher(
+            Float64MultiArray,
+            self._throw_batch_topic,
+            10,
+        )
         # BEST_EFFORT matches RealSense ``image_raw``; avoids RELIABLE backlog vs a fast camera.
         self.create_subscription(
             Image,
@@ -312,13 +335,18 @@ class BeanBagNnDetector(Node):
             qos_profile=_NN_IMAGE_QOS,
         )
 
-        if self._enable_y_snapshot:
-            self._stdin_snapshot_thread = threading.Thread(target=self._stdin_y_snapshot_loop, daemon=True)
-            self._stdin_snapshot_thread.start()
-            self.get_logger().info(
-                f'Y-snapshot enabled: type y then Enter in this terminal to save a labeled PNG under '
-                f'{self._snapshot_dir!r}'
-            )
+        if self._segmented_throw_mode or self._enable_y_snapshot:
+            self._stdin_cmd_thread = threading.Thread(target=self._stdin_command_loop, daemon=True)
+            self._stdin_cmd_thread.start()
+            if self._segmented_throw_mode:
+                self.get_logger().info(
+                    f'Segmented throw: type b + Enter to start recording, e + Enter to stop; '
+                    f'middle-3 YOLO -> {self._throw_batch_topic!r}'
+                )
+            if self._enable_y_snapshot:
+                self.get_logger().info(
+                    f'Y-snapshot: type y + Enter to save a labeled PNG under {self._snapshot_dir!r}'
+                )
         if self._stream_snapshots_enabled:
             qsz = max(
                 1,
@@ -396,17 +424,129 @@ class BeanBagNnDetector(Node):
         )
         self._enqueue_stream_png(out_path, vis)
 
-    def _stdin_y_snapshot_loop(self) -> None:
-        sys.stdout.write('Type y then Enter to save the latest frame with NN labels to log/NN...\n')
+    def _stdin_command_loop(self) -> None:
+        sys.stdout.write('Commands: b+Enter=start throw segment, e+Enter=end+infer middle-3, y+Enter=PNG snapshot\n')
         sys.stdout.flush()
         while rclpy.ok():
             try:
                 line = input()
             except EOFError:
                 return
-            if line.strip().casefold() != 'y':
-                continue
-            #TODO: Debug image save self._save_y_snapshot()
+            s = line.strip().casefold()
+            if s == 'b' and self._segmented_throw_mode:
+                with self._seg_lock:
+                    self._segment_buffer.clear()
+                    self._segment_recording = True
+                self.get_logger().info('segment: recording started (e+Enter to stop, middle-3 YOLO on stop)')
+            elif s == 'e' and self._segmented_throw_mode:
+                self._finalize_throw_segment()
+            elif s == 'y' and self._enable_y_snapshot:
+                self._save_y_snapshot()
+
+    def _finalize_throw_segment(self) -> None:
+        with self._seg_lock:
+            if not self._segment_recording:
+                self.get_logger().warn('segment: not recording; ignored')
+                return
+            buf = list(self._segment_buffer)
+            self._segment_buffer.clear()
+            self._segment_recording = False
+        n = len(buf)
+        if n < 3:
+            self.get_logger().error(
+                f'segment: need at least 3 frames, got {n}; not publishing batch',
+            )
+            return
+        start = (n - 3) // 2
+        h0, w0 = buf[0][1].shape[:2]
+        triple: list[tuple[int, np.ndarray]] = []
+        for k in range(3):
+            idx = start + k
+            stamp_ns, bgr = buf[idx]
+            t_decode0 = time.perf_counter()
+            pkwargs: dict[str, Any] = {
+                'source': bgr,
+                'imgsz': int(self._inf_size),
+                'conf': float(self._conf_thr),
+                'device': self._device,
+                'verbose': False,
+                'half': False,
+                'max_det': 1,
+            }
+            if self._class_ids:
+                pkwargs['classes'] = self._class_ids
+            results = self._model.predict(**pkwargs)
+            t_post0 = time.perf_counter()
+            infer_ms = (t_post0 - t_decode0) * 1000.0
+            row, snap_conf, snap_corners = self._detection_row_from_results(results, h0, w0)
+            t_end = time.perf_counter()
+            post_ms = (t_end - t_post0) * 1000.0
+            if self._debug_throw_pipeline:
+                tsec, tnsec = stamp_ns // 1_000_000_000, stamp_ns % 1_000_000_000
+                self.get_logger().info(
+                    f'[nn_throw_debug] middle k={k} buffer_idx={idx} N={n} '
+                    f'stamp={tsec}.{tnsec:09d} infer_ms={infer_ms:.2f} post_ms={post_ms:.2f}',
+                )
+                self.get_logger().info(
+                    f'[nn_throw_debug]   det_row[9]={np.asarray(row, dtype=np.float32).ravel()[:9].tolist()}',
+                )
+            if self._enable_y_snapshot:
+                with self._frame_lock:
+                    self._snap_bgr = bgr.copy()
+                    self._snap_conf = float(snap_conf)
+                    self._snap_corners = None if snap_corners is None else snap_corners.copy()
+            if self._stream_snapshots_enabled:
+                self._maybe_save_stream_snapshot(bgr, snap_conf, snap_corners)
+            triple.append((stamp_ns, row))
+        if self._debug_throw_pipeline:
+            self.get_logger().info(
+                f'[nn_throw_debug] selected middle-3: start_idx={start} of N={n} '
+                f'stamps_ns={[t[0] for t in triple]}',
+            )
+        try:
+            batch = pack_throw_batch(w0, h0, triple)
+        except Exception as exc:
+            self.get_logger().error(f'segment: pack batch failed: {exc}')
+            return
+        if self._debug_throw_pipeline:
+            for i, (st_ns, r) in enumerate(triple):
+                tsec, tn = st_ns // 1_000_000_000, st_ns % 1_000_000_000
+                self.get_logger().info(
+                    f'[nn_throw_debug] to_bag_sense i={i} stamp={tsec}.{tn:09d} row={r.ravel()[:9].tolist()}',
+                )
+        self._pub_throw_batch.publish(batch)
+        self.get_logger().info(
+            f'segment: published {self._throw_batch_topic!r} (middle-3, N={n} buffered)',
+        )
+
+    def _detection_row_from_results(
+        self,
+        results: Any,
+        h0: int,
+        w0: int,
+    ) -> tuple[np.ndarray, float, np.ndarray | None]:
+        row = np.zeros((1, 9), dtype=np.float32)
+        snap_conf = 0.0
+        snap_corners: np.ndarray | None = None
+        if results:
+            r = results[0]
+            if r.boxes is not None and len(r.boxes) > 0:
+                xyxy = r.boxes.xyxy.cpu().numpy().astype(np.float32)
+                confs = r.boxes.conf.cpu().numpy().astype(np.float32)
+                if self._stream_snapshots_enabled:
+                    sel = confs >= (self._stream_min_conf - 1e-9)
+                else:
+                    sel = np.ones(len(confs), dtype=bool)
+                if np.any(sel):
+                    masked = np.where(sel, confs, -1.0)
+                    idx = int(np.argmax(masked))
+                    best = _clip_xyxy(xyxy[idx], h0, w0)
+                    corners = _xyxy_to_corners_tl_tr_br_bl(best)
+                    flat = corners.reshape(8).astype(np.float32)
+                    row = np.concatenate([[float(confs[idx])], flat]).reshape(1, 9).astype(np.float32)
+                    snap_conf = float(confs[idx])
+                    snap_corners = corners.copy()
+        return row, snap_conf, snap_corners
 
     def _save_y_snapshot(self) -> None:
         out_dir = self._snapshot_dir
@@ -491,16 +631,25 @@ class BeanBagNnDetector(Node):
     def _color_cb(self, msg: Image) -> None:
         if not rclpy.ok():
             return
+        t_decode0 = time.perf_counter()
+        bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        h0, w0 = bgr.shape[:2]
+        stamp_ns = Time.from_msg(msg.header).nanoseconds
+
+        if self._segmented_throw_mode:
+            with self._seg_lock:
+                if self._segment_recording:
+                    self._segment_buffer.append((stamp_ns, bgr.copy()))
+                    while len(self._segment_buffer) > self._throw_segment_max_frames:
+                        self._segment_buffer.pop(0)
+                    return
+
         if self._max_fps > 0.0:
             now = time.monotonic()
             min_dt = 1.0 / self._max_fps
             if now - self._last_infer_mono < min_dt:
                 return
             self._last_infer_mono = now
-
-        t_decode0 = time.perf_counter()
-        bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        h0, w0 = bgr.shape[:2]
 
         yolo_conf = float(self._conf_thr)
         if self._stream_snapshots_enabled:
@@ -512,7 +661,6 @@ class BeanBagNnDetector(Node):
             'device': self._device,
             'verbose': False,
             'half': False,
-            # Single cornhole bag → less NMS work; does not change stamp behavior.
             'max_det': 1,
         }
         if self._class_ids:
@@ -532,28 +680,7 @@ class BeanBagNnDetector(Node):
                 )
             raise
         t_post0 = time.perf_counter()
-        row = np.zeros((1, 9), dtype=np.float32)
-        snap_conf = 0.0
-        snap_corners: np.ndarray | None = None
-
-        if results:
-            r = results[0]
-            if r.boxes is not None and len(r.boxes) > 0:
-                xyxy = r.boxes.xyxy.cpu().numpy().astype(np.float32)
-                confs = r.boxes.conf.cpu().numpy().astype(np.float32)
-                if self._stream_snapshots_enabled:
-                    sel = confs >= (self._stream_min_conf - 1e-9)
-                else:
-                    sel = np.ones(len(confs), dtype=bool)
-                if np.any(sel):
-                    masked = np.where(sel, confs, -1.0)
-                    idx = int(np.argmax(masked))
-                    best = _clip_xyxy(xyxy[idx], h0, w0)
-                    corners = _xyxy_to_corners_tl_tr_br_bl(best)
-                    flat = corners.reshape(8).astype(np.float32)
-                    row = np.concatenate([[float(confs[idx])], flat]).reshape(1, 9).astype(np.float32)
-                    snap_conf = float(confs[idx])
-                    snap_corners = corners.copy()
+        row, snap_conf, snap_corners = self._detection_row_from_results(results, h0, w0)
 
         if self._stream_snapshots_enabled:
             self._maybe_save_stream_snapshot(bgr, snap_conf, snap_corners)

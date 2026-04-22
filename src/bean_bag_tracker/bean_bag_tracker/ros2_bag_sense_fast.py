@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Bean bag trajectory from color + depth + NN detection (``/bean_bag_detection``).
+"""Bean bag trajectory: depth at NN box + ``trajectory_common`` fit.
 
-Syncs each detection frame with depth, reads Z at the NN box centroid, and buffers
-3D points during a throw. After ``throw_silence_timeout_sec`` with no new valid
-sample, the **three middle** samples are used for the trajectory fit in
-``trajectory_common``.
+Two input modes (see ``use_segment_batch_from_nn``):
+- **Batch (recommended with keyboard segment on NN):** three middle samples arrive on
+  ``/bean_bag_throw_batch`` from ``bean_bag_nn_detector``; this node only needs depth
+  to sample Z at the centroid and intrinsics to build ``(t,x,y,z)``.
+- **Legacy:** soft-synced color + ``/bean_bag_detection`` + depth; throw buffer and
+  ``throw_silence_timeout_sec`` then middle-3 fit.
 """
 import os
 import threading
@@ -16,13 +18,14 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CameraInfo
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, Float64MultiArray
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 
 from bean_bag_tracker.trajectory_common import TrajectoryPoint, compute_and_publish_points
+from bean_bag_tracker.throw_batch_msg import unpack_throw_batch
 
 
 def _default_centroid_png_dir() -> str:
@@ -62,14 +65,16 @@ class BeanBagTracker(Node):
         # Slow NN can publish detections long after the color frame; keep enough stamps so pairs are not evicted.
         self.declare_parameter('stamp_cache_max', 400)
         self.declare_parameter('depth_ring_max', 400)
-        self.declare_parameter('debug_ingest', False)
-        self.declare_parameter('debug_ingest_period_sec', 0.5)
+        # When true, consume ``Float64MultiArray`` on throw_batch_topic (from segmented NN) only.
+        self.declare_parameter('use_segment_batch_from_nn', True)
+        self.declare_parameter('throw_batch_topic', '/bean_bag_throw_batch')
+        self.declare_parameter('debug_throw_pipeline', False)
         # Save color PNG with box + centroid + depth whenever a synced NN detection has a box.
         self.declare_parameter('centroid_png_enabled', True)
         # Empty string → ``<workspace>/log/bag_fast_centroid`` (see ``_default_centroid_png_dir``).
         self.declare_parameter('centroid_png_output_dir', '')
         # End one throw when no valid in-band sample (box + depth) for this long (monotonic clock).
-        self.declare_parameter('throw_silence_timeout_sec', 0.5)
+        self.declare_parameter('throw_silence_timeout_sec', 2)
         # Drop oldest buffer entries if the throw produces more than this (prevents unbounded memory).
         self.declare_parameter('max_throw_buffer_frames', 400)
         self.hole_distance = self.get_parameter('hole_distance_inches').value * 0.0254  # convert to meters
@@ -85,8 +90,9 @@ class BeanBagTracker(Node):
         self._sync_slop_ns = int(self._sync_slop_sec * 1e9)
         self._stamp_cache_max = max(32, int(self.get_parameter('stamp_cache_max').value))
         self._depth_ring_max = max(60, int(self.get_parameter('depth_ring_max').value))
-        self._debug_ingest = bool(self.get_parameter('debug_ingest').value)
-        self._debug_ingest_period = max(0.05, float(self.get_parameter('debug_ingest_period_sec').value))
+        self._use_segment_batch = bool(self.get_parameter('use_segment_batch_from_nn').value)
+        self._throw_batch_topic = str(self.get_parameter('throw_batch_topic').value).strip() or '/bean_bag_throw_batch'
+        self._debug_throw_pipeline = bool(self.get_parameter('debug_throw_pipeline').value)
         self._centroid_png_enabled = bool(self.get_parameter('centroid_png_enabled').value)
         _raw_png_dir = str(self.get_parameter('centroid_png_output_dir').value).strip()
         self._centroid_png_dir = (
@@ -121,7 +127,6 @@ class BeanBagTracker(Node):
         self._ingest_no_detection = 0
         self._ingest_invalid_depth = 0
         self._ingest_short_detection_row = 0
-        self._ingest_first_detection_logged = False
         self._last_det_conf = 0.0
         self._last_centroid_uv: tuple[int, int] | None = None
         self._last_depth_m: float | None = None
@@ -147,17 +152,7 @@ class BeanBagTracker(Node):
                                                self.get_parameter('result_topic').value, 
                                                10)
 
-        ct = self.get_parameter('color_topic').value
         dt = self.get_parameter('depth_topic').value
-        bt = self.get_parameter('bag_detection_topic').value
-        # Stamp-based soft sync (color + det share the same stamp from NN; depth matched within slop).
-        self.create_subscription(
-            Image,
-            ct,
-            self._on_color_soft,
-            qos_profile=qos_profile_sensor_data,
-            callback_group=self.callback_group,
-        )
         self.create_subscription(
             Image,
             dt,
@@ -165,29 +160,40 @@ class BeanBagTracker(Node):
             qos_profile=qos_profile_sensor_data,
             callback_group=self.callback_group,
         )
-        self.info_sub = self.create_subscription(CameraInfo,
-                                                 self.get_parameter('camera_info_topic').value,
-                                                 self.camera_info_callback,
-                                                 1)
-
-        # Match ``bean_bag_nn_detector`` publisher (sensor_data / BEST_EFFORT like RealSense color).
-        self.create_subscription(
-            Image,
-            bt,
-            self._on_det_soft,
-            qos_profile=qos_profile_sensor_data,
-            callback_group=self.callback_group,
+        self.info_sub = self.create_subscription(
+            CameraInfo,
+            self.get_parameter('camera_info_topic').value,
+            self.camera_info_callback,
+            1,
         )
 
-        # Detect end of throw: no new valid in-band sample for throw_silence_timeout_sec.
-        self._throw_silence_timer = self.create_timer(
-            0.05, self._throw_silence_timer_callback, callback_group=self.callback_group
-        )
-        if self._debug_ingest:
-            self._ingest_debug_timer = self.create_timer(
-                self._debug_ingest_period,
-                self._debug_ingest_timer_callback,
+        if self._use_segment_batch:
+            self.create_subscription(
+                Float64MultiArray,
+                self._throw_batch_topic,
+                self._on_throw_batch,
+                10,
                 callback_group=self.callback_group,
+            )
+        else:
+            ct = self.get_parameter('color_topic').value
+            bt = self.get_parameter('bag_detection_topic').value
+            self.create_subscription(
+                Image,
+                ct,
+                self._on_color_soft,
+                qos_profile=qos_profile_sensor_data,
+                callback_group=self.callback_group,
+            )
+            self.create_subscription(
+                Image,
+                bt,
+                self._on_det_soft,
+                qos_profile=qos_profile_sensor_data,
+                callback_group=self.callback_group,
+            )
+            self._throw_silence_timer = self.create_timer(
+                0.05, self._throw_silence_timer_callback, callback_group=self.callback_group
             )
 
         self._ingest_health_timer = self.create_timer(
@@ -196,27 +202,19 @@ class BeanBagTracker(Node):
             callback_group=self.callback_group,
         )
 
-        self.get_logger().info('Bean Bag Tracker node started')
+        mode = 'segment_batch' if self._use_segment_batch else 'legacy_sync'
         self.get_logger().info(
-            f'Depth scale is: {self.depth_scale} m/raw_unit '
-            '(ROS param depth_scale; same role as depth_sensor.get_depth_scale())'
+            f'bean_bag_tracker started mode={mode} depth_scale={self.depth_scale} sync_slop_sec={self._sync_slop_sec:g}'
         )
-        self.get_logger().info(
-            f'NN bag sense — buffers in-band valid dets; after throw_silence_timeout_sec='
-            f'{self._throw_silence_timeout:g} s without a new valid sample, uses middle-3 of buffer; '
-            f'in-band {self.min_z_meters:g} < z < {self.max_z_meters:g} m; max_throw_buffer_frames='
-            f'{self._max_throw_buffer}; bag_detection_topic='
-            f'{self.get_parameter("bag_detection_topic").value!r} '
-            f'(1×9 float32 Image, depth slop sync_slop_sec={self._sync_slop_sec:g})'
-        )
-        self.get_logger().info(
-            'Color + depth + bag_detection: qos_profile_sensor_data (BEST_EFFORT). '
-            'Triples: color stamp == det stamp + nearest depth within sync_slop_sec.',
-        )
-        if self._debug_ingest:
+        if self._use_segment_batch:
             self.get_logger().info(
-                f'Debug ingest: periodic INFO every {self._debug_ingest_period:g}s '
-                '(set debug_ingest:=false to keep the terminal quiet).',
+                f'Segment batch: {self._throw_batch_topic!r} + depth; in-band z in '
+                f'({self.min_z_meters:g}, {self.max_z_meters:g}) m',
+            )
+        else:
+            self.get_logger().info(
+                f'Legacy: color+det+depth, throw_silence_timeout_sec={self._throw_silence_timeout:g} s, '
+                f'max_throw_buffer_frames={self._max_throw_buffer}',
             )
 
     def _ingest_health_once(self) -> None:
@@ -230,15 +228,26 @@ class BeanBagTracker(Node):
             pass
         ct = self.get_parameter('color_topic').value
         dt = self.get_parameter('depth_topic').value
-        bt = self.get_parameter('bag_detection_topic').value
-        pc = self.count_publishers(ct)
         pd = self.count_publishers(dt)
-        pb = self.count_publishers(bt)
         with self._ingest_lock:
             sync = self._ingest_sync_total
         with self._soft_sync_lock:
-            rxc = self._rx_color
             rxd = self._rx_depth
+        if self._use_segment_batch:
+            pbatch = self.count_publishers(self._throw_batch_topic)
+            if self._rx_depth == 0 and not self._zero_sync_warned:
+                self._zero_sync_warned = True
+                self.get_logger().warn(
+                    f'~6s: no depth for batch mode. depth rx={self._rx_depth} depth_pub={pd} '
+                    f'throw_batch_pub={pbatch} topic={self._throw_batch_topic!r}.',
+                )
+            return
+        ct = self.get_parameter('color_topic').value
+        bt = self.get_parameter('bag_detection_topic').value
+        pc = self.count_publishers(ct)
+        pb = self.count_publishers(bt)
+        with self._soft_sync_lock:
+            rxc = self._rx_color
             rxf = self._rx_det
         if sync == 0 and not self._zero_sync_warned:
             self._zero_sync_warned = True
@@ -250,33 +259,6 @@ class BeanBagTracker(Node):
                 f'(5) publisher counts color={pc} depth={pd} bag_detection={pb}; '
                 f'(6) messages received color={rxc} depth={rxd} det={rxf}.',
             )
-
-    def _debug_ingest_timer_callback(self) -> None:
-        if not self._debug_ingest:
-            return
-        with self._ingest_lock:
-            sync = self._ingest_sync_total
-            wdet = self._ingest_with_detection
-            ndet = self._ingest_no_detection
-            bad = self._ingest_invalid_depth
-            short = self._ingest_short_detection_row
-            conf = self._last_det_conf
-            uv = self._last_centroid_uv
-            zm = self._last_depth_m
-            cf = self._last_corners_flat
-            skew = self._last_stamp_skew_color_det_ns
-            enc = self._last_det_encoding
-            shp = self._last_det_shape
-        with self._state_lock:
-            throw_n = len(self._throw_buffer)
-        skew_ms = (skew / 1e6) if skew is not None else None
-        skew_s = f'{skew_ms:.2f} ms color-vs-det' if skew_ms is not None else 'n/a'
-        self.get_logger().info(
-            '[ingest] '
-            f'sync={sync} nn_box={wdet} no_box={ndet} bad_depth={bad} short_row={short} '
-            f'throw_buffer={throw_n} | conf={conf:.3f} uv={uv} z_m={zm} | '
-            f'det {shp} {enc} skew={skew_s}',
-        )
 
     def camera_info_callback(self, msg):
         """Extract camera intrinsics once."""
@@ -388,6 +370,120 @@ class BeanBagTracker(Node):
         start = (n - 3) // 2
         return s[start : start + 3]
 
+    @staticmethod
+    def _decode_det_row_flat(flat: np.ndarray) -> tuple[float, np.ndarray | None]:
+        """Return ``(conf, corners 4x2)`` or no box when ``conf<=0`` or short row."""
+        arr = np.asarray(flat, dtype=np.float64).reshape(-1)
+        if arr.size < 9:
+            return 0.0, None
+        conf = float(arr[0])
+        if conf <= 0.0:
+            return conf, None
+        return conf, arr[1:9].reshape(4, 2)
+
+    def _on_throw_batch(self, msg: Float64MultiArray) -> None:
+        if self.fx is None:
+            return
+        up = unpack_throw_batch(msg)
+        if up is None:
+            self.get_logger().error('throw_batch: unpack failed (wrong version or length)')
+            return
+        color_w, color_h, three = up
+        points: list[TrajectoryPoint] = []
+        for i, (stamp_ns, row) in enumerate(three):
+            _conf, corners = self._decode_det_row_flat(row)
+            if corners is None:
+                self.get_logger().error(f'throw_batch: sample {i} has no valid detection')
+                return
+            if self._debug_throw_pipeline:
+                ts, tn = stamp_ns // 1_000_000_000, stamp_ns % 1_000_000_000
+                self.get_logger().info(
+                    f'[bag_fast_throw_debug] rx i={i} stamp={ts}.{tn:09d} vertices_px={corners.tolist()}',
+                )
+            pt = self._trajectory_point_at_stamp(
+                stamp_ns, corners, int(color_w), int(color_h), sample_index=i
+            )
+            if pt is None:
+                return
+            points.append(pt)
+        if len(points) != 3:
+            return
+        _, _, new_last = compute_and_publish_points(
+            points=points,
+            depth_scale=self.depth_scale,
+            hole_distance_m=self.hole_distance,
+            max_publish_distance_m=self.max_publish_distance_m,
+            min_publish_interval_sec=self.min_publish_interval,
+            last_publish_mono=self._last_publish_mono,
+            now_mono=time.monotonic(),
+            publisher=self.publisher.publish,
+            result_topic=self.get_parameter('result_topic').value,
+            log_info=self.get_logger().info,
+            log_warn=self.get_logger().warn,
+        )
+        self._last_publish_mono = new_last
+        if self._debug_throw_pipeline:
+            self.get_logger().info(
+                '[bag_fast_throw_debug] trajectory fit complete (see `bag distance backtrack` block above for x(t), y(t), depth(t))',
+            )
+
+    def _trajectory_point_at_stamp(
+        self,
+        stamp_ns: int,
+        corners: np.ndarray,
+        color_w: int,
+        color_h: int,
+        *,
+        sample_index: int,
+    ) -> TrajectoryPoint | None:
+        w = color_w
+        h = color_h
+        u = int(np.clip(int(round(float(np.mean(corners[:, 0])))), 0, w - 1))
+        v = int(np.clip(int(round(float(np.mean(corners[:, 1])))), 0, h - 1))
+        with self._soft_sync_lock:
+            dmsg = self._nearest_depth_locked(stamp_ns)
+        if dmsg is None:
+            self.get_logger().error(
+                f'throw_batch: no depth image within sync_slop for stamp_ns={stamp_ns} '
+                f'(increase depth_ring_max or reduce throw duration)',
+            )
+            return None
+        dns = Time.from_msg(dmsg.header.stamp).nanoseconds
+        depth_image = self.bridge.imgmsg_to_cv2(dmsg, '16UC1')
+        dh, dw = depth_image.shape[:2]
+        ud = int(np.clip(u, 0, dw - 1))
+        vd = int(np.clip(v, 0, dh - 1))
+        depth_raw_u16 = int(depth_image[vd, ud])
+        depth = depth_raw_u16 * self.depth_scale
+        bbox_area_px = self._bbox_area_from_corners(corners)
+
+        if self._debug_throw_pipeline:
+            dlt = abs(dns - stamp_ns)
+            self.get_logger().info(
+                f'[bag_fast_throw_debug] i={sample_index} depth@({ud},{vd}) raw16={depth_raw_u16} '
+                f'z_m={depth:.6f} match_delta_ns={dlt} slop_ns={self._sync_slop_ns} '
+                f'in_band={self.min_z_meters < depth < self.max_z_meters}'
+            )
+            self.get_logger().info(
+                f'[bag_fast_throw_debug] i={sample_index} t_ros_s={stamp_ns/1e9:.9f} u={u} v={v}  '
+                f'x={((u - self.cx) * depth / self.fx):.6f}  y={((v - self.cy) * depth / self.fy):.6f}  z_depth={depth:.6f} m',
+            )
+
+        if depth_raw_u16 == 0:
+            self.get_logger().error(f'throw_batch: sample {sample_index} invalid depth at centroid')
+            return None
+        in_band = self.min_z_meters < depth < self.max_z_meters
+        if not in_band:
+            self.get_logger().error(
+                f'throw_batch: sample {sample_index} depth {depth:.4f} m out of in-band z range',
+            )
+            return None
+
+        t = stamp_ns / 1e9
+        x = (u - self.cx) * depth / self.fx
+        y = (v - self.cy) * depth / self.fy
+        return (t, x, y, depth, u, v, bbox_area_px)
+
     def _write_centroid_snapshot_png(
         self,
         bgr: np.ndarray,
@@ -493,11 +589,6 @@ class BeanBagTracker(Node):
                 self._last_centroid_uv = None
                 self._last_depth_m = None
                 self._last_corners_flat = ''
-            if self._debug_ingest:
-                self.get_logger().debug(
-                    f'[ingest] NN detector message OK but no box: conf={float(_conf):.4f} '
-                    f'(conf<=0 or short row) det {self._last_det_shape} enc={self._last_det_encoding!r}',
-                )
             return
 
         with self._ingest_lock:
@@ -509,13 +600,6 @@ class BeanBagTracker(Node):
                 separator=',',
                 max_line_width=120,
             )
-            if not self._ingest_first_detection_logged:
-                self._ingest_first_detection_logged = True
-                self.get_logger().info(
-                    '[bean_bag_sense_fast/ingest] first synchronized NN detection accepted from '
-                    f'{self.get_parameter("bag_detection_topic").value!r}: '
-                    f'conf={float(_conf):.4f} corners(flat 8)={self._last_corners_flat}',
-                )
 
         u, v = self._centroid_uv_from_corners(corners)
         u = int(np.clip(u, 0, w - 1))
@@ -534,10 +618,6 @@ class BeanBagTracker(Node):
                 self._ingest_invalid_depth += 1
                 self._last_centroid_uv = (u, v)
                 self._last_depth_m = None
-            if self._debug_ingest:
-                self.get_logger().debug(
-                    f'[ingest] NN box at centroid ({u},{v}) but depth=0 (invalid); conf={float(_conf):.4f}',
-                )
             return
 
         with self._ingest_lock:
@@ -564,13 +644,6 @@ class BeanBagTracker(Node):
                             f'throw buffer exceeded max_throw_buffer_frames={self._max_throw_buffer}; '
                             f'dropped {over} oldest sample(s).',
                         )
-            if self._debug_ingest:
-                with self._state_lock:
-                    nb = len(self._throw_buffer)
-                self.get_logger().info(
-                    f'[bean_bag_sense_fast/ingest] buffered {nb} in-band: '
-                    f'nn_conf={float(_conf):.4f} centroid=({u},{v}) depth_m={depth:.4f}',
-                )
 
     def _throw_silence_timer_callback(self) -> None:
         """If the throw buffer has not grown for throw_silence_timeout_sec, finalize the throw."""
@@ -595,9 +668,6 @@ class BeanBagTracker(Node):
             )
             return
         three = self._middle_three(raw)
-        self.get_logger().info(
-            f'throw finalize: N={n} in-band → middle-3 of {3} (t_rel from first in triple follows in backtrack).',
-        )
         _, _, new_last = compute_and_publish_points(
             points=three,
             depth_scale=self.depth_scale,
