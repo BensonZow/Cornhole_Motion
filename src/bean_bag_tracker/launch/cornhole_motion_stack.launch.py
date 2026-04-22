@@ -105,6 +105,8 @@ def generate_launch_description() -> LaunchDescription:
                 'bag_detection_topic': '/bean_bag_detection',
                 'min_z_meters': 0.2,
                 'max_z_meters': 4.0,
+                'throw_silence_timeout_sec': 0.5,
+                'max_throw_buffer_frames': 400,
             }
         ],
         condition=UnlessCondition(LaunchConfiguration('manual_depth_tracker')),

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Bean bag trajectory from color + depth + NN detection (``/bean_bag_detection``).
 
-Depth is read only at the NN box centroid. Samples are taken only on a strict
-approach toward the camera (depth decreasing), after a frame beyond ``max_z_meters``.
+Syncs each detection frame with depth, reads Z at the NN box centroid, and buffers
+3D points during a throw. After ``throw_silence_timeout_sec`` with no new valid
+sample, the **three middle** samples are used for the trajectory fit in
+``trajectory_common``.
 """
 import os
-import sys
 import threading
 import time
 from collections import deque
@@ -21,7 +22,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 
-from bean_bag_tracker.trajectory_common import compute_and_publish_points
+from bean_bag_tracker.trajectory_common import TrajectoryPoint, compute_and_publish_points
 
 
 def _default_centroid_png_dir() -> str:
@@ -35,24 +36,6 @@ def _default_centroid_png_dir() -> str:
             break
         p = parent
     return os.path.join(os.path.expanduser('~'), 'ros2_jazzy', 'log', 'bag_fast_centroid')
-
-
-def _wait_for_confirm_y_line() -> None:
-    """Block until the user types ``y`` and ends the line (Enter / Return).
-
-    Uses line-oriented ``input()`` so the same behavior applies on Windows
-    (CRLF), macOS, and Linux (LF). Empty lines and other text are ignored until
-    a line whose stripped value is ``y`` (case-insensitive).
-    """
-    sys.stdout.write('Type y then press Enter when ready for the next bag...\n')
-    sys.stdout.flush()
-    while True:
-        try:
-            line = input()
-        except EOFError:
-            return
-        if line.strip().casefold() == 'y':
-            return
 
 
 class BeanBagTracker(Node):
@@ -70,7 +53,7 @@ class BeanBagTracker(Node):
         self.declare_parameter('result_topic', '/bean_bag_trajectory')
         self.declare_parameter('reset_delay_sec', 10.0)
         self.declare_parameter('min_publish_interval_sec', 5.0)
-        # Max miss (m): hypot(x_land, depth_land - z_hole); larger → no publish, keyboard still arms.
+        # Max miss (m): hypot(x_land, depth_land - z_hole); larger → no publish.
         self.declare_parameter('max_publish_distance_m', 0.5)
         self.declare_parameter('bag_detection_topic', '/bean_bag_detection')
         self.declare_parameter('min_z_meters', 0.2)
@@ -85,12 +68,19 @@ class BeanBagTracker(Node):
         self.declare_parameter('centroid_png_enabled', True)
         # Empty string → ``<workspace>/log/bag_fast_centroid`` (see ``_default_centroid_png_dir``).
         self.declare_parameter('centroid_png_output_dir', '')
+        # End one throw when no valid in-band sample (box + depth) for this long (monotonic clock).
+        self.declare_parameter('throw_silence_timeout_sec', 0.5)
+        # Drop oldest buffer entries if the throw produces more than this (prevents unbounded memory).
+        self.declare_parameter('max_throw_buffer_frames', 400)
         self.hole_distance = self.get_parameter('hole_distance_inches').value * 0.0254  # convert to meters
         self.depth_scale = float(self.get_parameter('depth_scale').value)
         self.min_publish_interval = float(self.get_parameter('min_publish_interval_sec').value)
         self.max_publish_distance_m = float(self.get_parameter('max_publish_distance_m').value)
         self.min_z_meters = float(self.get_parameter('min_z_meters').value)
         self.max_z_meters = float(self.get_parameter('max_z_meters').value)
+        self._throw_silence_timeout = max(0.05, float(self.get_parameter('throw_silence_timeout_sec').value))
+        self._max_throw_buffer = max(3, int(self.get_parameter('max_throw_buffer_frames').value))
+        self._last_buffer_trim_log_mono = float('-inf')
         self._sync_slop_sec = max(0.05, float(self.get_parameter('sync_slop_sec').value))
         self._sync_slop_ns = int(self._sync_slop_sec * 1e9)
         self._stamp_cache_max = max(32, int(self.get_parameter('stamp_cache_max').value))
@@ -120,19 +110,11 @@ class BeanBagTracker(Node):
 
         self._last_publish_mono = float('-inf')
         self._state_lock = threading.Lock()
-        self._pending_keyboard_reset = False
-        self._stdin_arm_thread: threading.Thread | None = None
+        # (t, x, y, depth_m, u_px, v_px, bbox_area_px) per accepted in-band frame (throw buffer)
+        self._throw_buffer: list[TrajectoryPoint] = []
+        self._last_valid_append_mono: float | None = None
         # Camera intrinsics (filled when CameraInfo received)
         self.fx = self.fy = self.cx = self.cy = None
-
-        # State variables
-        self.required_points = 3 
-        self.state = 'IDLE'          # IDLE, COLLECTING, WAIT
-        # (t, x, y, depth_m, u_px, v_px, bbox_area_px) — u,v = NN bbox centroid; depth only at centroid
-        self.points = []
-        # Previous synced-frame depth (m) at NN centroid; used for far→approaching (rising-edge) gate
-        self._prev_nn_centroid_depth: float | None = None
-        self._debug_first_frame_bgr: np.ndarray | None = None
         self._ingest_lock = threading.Lock()
         self._ingest_sync_total = 0
         self._ingest_with_detection = 0
@@ -197,9 +179,10 @@ class BeanBagTracker(Node):
             callback_group=self.callback_group,
         )
 
-        # stdin thread sets _pending_keyboard_reset; this timer runs on the executor thread.
-        self._keyboard_poll_timer = self.create_timer(
-            0.05, self._keyboard_poll_callback, callback_group=self.callback_group)
+        # Detect end of throw: no new valid in-band sample for throw_silence_timeout_sec.
+        self._throw_silence_timer = self.create_timer(
+            0.05, self._throw_silence_timer_callback, callback_group=self.callback_group
+        )
         if self._debug_ingest:
             self._ingest_debug_timer = self.create_timer(
                 self._debug_ingest_period,
@@ -219,11 +202,12 @@ class BeanBagTracker(Node):
             '(ROS param depth_scale; same role as depth_sensor.get_depth_scale())'
         )
         self.get_logger().info(
-            f'NN bag sense — samples only when z_centroid strictly decreases; first sample needs '
-            f'prev_z > max_z ({self.max_z_meters:g} m) then closer; in-band {self.min_z_meters:g} < z < '
-            f'{self.max_z_meters:g} m; bag_detection_topic='
+            f'NN bag sense — buffers in-band valid dets; after throw_silence_timeout_sec='
+            f'{self._throw_silence_timeout:g} s without a new valid sample, uses middle-3 of buffer; '
+            f'in-band {self.min_z_meters:g} < z < {self.max_z_meters:g} m; max_throw_buffer_frames='
+            f'{self._max_throw_buffer}; bag_detection_topic='
             f'{self.get_parameter("bag_detection_topic").value!r} '
-            f'(1×9 float32 Image, depth match slop sync_slop_sec={self._sync_slop_sec:g})'
+            f'(1×9 float32 Image, depth slop sync_slop_sec={self._sync_slop_sec:g})'
         )
         self.get_logger().info(
             'Color + depth + bag_detection: qos_profile_sensor_data (BEST_EFFORT). '
@@ -284,14 +268,13 @@ class BeanBagTracker(Node):
             enc = self._last_det_encoding
             shp = self._last_det_shape
         with self._state_lock:
-            st = self.state
-            prev_z = self._prev_nn_centroid_depth
+            throw_n = len(self._throw_buffer)
         skew_ms = (skew / 1e6) if skew is not None else None
         skew_s = f'{skew_ms:.2f} ms color-vs-det' if skew_ms is not None else 'n/a'
         self.get_logger().info(
             '[ingest] '
             f'sync={sync} nn_box={wdet} no_box={ndet} bad_depth={bad} short_row={short} '
-            f'state={st} prev_z={prev_z} | conf={conf:.3f} uv={uv} z_m={zm} | '
+            f'throw_buffer={throw_n} | conf={conf:.3f} uv={uv} z_m={zm} | '
             f'det {shp} {enc} skew={skew_s}',
         )
 
@@ -395,6 +378,16 @@ class BeanBagTracker(Node):
         umax, vmax = corners.max(axis=0)
         return float(max(0.0, umax - umin) * max(0.0, vmax - vmin))
 
+    @staticmethod
+    def _middle_three(points: list[TrajectoryPoint]) -> list[TrajectoryPoint]:
+        """Sorted by time, then the centered window of three samples."""
+        if len(points) < 3:
+            return []
+        s = sorted(points, key=lambda p: p[0])
+        n = len(s)
+        start = (n - 3) // 2
+        return s[start : start + 3]
+
     def _write_centroid_snapshot_png(
         self,
         bgr: np.ndarray,
@@ -459,7 +452,7 @@ class BeanBagTracker(Node):
             self.get_logger().warn(f'cv2.imwrite failed for {fn!r}')
 
     def _image_sync_callback(self, color_msg: Image, depth_msg: Image, det_msg: Image) -> None:
-        """Synchronized color, depth, and NN detection; collect up to three samples."""
+        """Synchronized color, depth, and NN detection; buffer valid 3D samples for a throw."""
         with self._ingest_lock:
             self._ingest_sync_total += 1
             t_c = Time.from_msg(color_msg.header.stamp).nanoseconds
@@ -490,7 +483,7 @@ class BeanBagTracker(Node):
                     color_image, corners, u0, v0, raw16, zm, float(_conf), stamp_ns,
                 )
 
-        if self.state == 'WAIT' or self.fx is None:
+        if self.fx is None:
             return
 
         if corners is None:
@@ -500,8 +493,6 @@ class BeanBagTracker(Node):
                 self._last_centroid_uv = None
                 self._last_depth_m = None
                 self._last_corners_flat = ''
-            with self._state_lock:
-                self._prev_nn_centroid_depth = None
             if self._debug_ingest:
                 self.get_logger().debug(
                     f'[ingest] NN detector message OK but no box: conf={float(_conf):.4f} '
@@ -558,124 +549,69 @@ class BeanBagTracker(Node):
         y = (v - self.cy) * depth / self.fy
 
         in_band = self.min_z_meters < depth < self.max_z_meters
-        skip_prev_update = False
-
-        with self._state_lock:
-            prev_d = self._prev_nn_centroid_depth
-            # Rising edge toward camera: last frame was beyond max_z, this frame is strictly closer.
-            approach_edge = prev_d is not None and prev_d > self.max_z_meters and depth < prev_d
-
-            if self.state == 'IDLE':
-                elapsed = time.monotonic() - self._last_publish_mono
-                if elapsed >= self.min_publish_interval and in_band and approach_edge:
-                    self.points = [(t, x, y, depth, u, v, bbox_area_px)]
-                    self.state = 'COLLECTING'
-                    self._debug_first_frame_bgr = color_image.copy()
-                    if self._debug_ingest:
-                        self.get_logger().info(
-                            '[bean_bag_sense_fast/ingest] COLLECTING 1/3: '
-                            f'nn_conf={float(_conf):.4f} centroid=({u},{v}) depth_m={depth:.4f} '
-                            f'bbox_area_px={bbox_area_px:.0f} in_band={in_band} approach_edge={approach_edge}',
-                        )
-
-            elif self.state == 'COLLECTING':
-                last_depth = self.points[-1][3]
-                if not in_band or not (depth < last_depth):
-                    # Ignore receding / flat / out-of-band: abort this approach (require new far→closer edge).
-                    self.points.clear()
-                    self.state = 'IDLE'
-                    self._debug_first_frame_bgr = None
-                    self._prev_nn_centroid_depth = None
-                    skip_prev_update = True
-                    if self._debug_ingest:
-                        self.get_logger().info(
-                            '[bean_bag_sense_fast/ingest] COLLECTING aborted: '
-                            f'in_band={in_band} depth={depth:.4f} m vs last={last_depth:.4f} m '
-                            f'nn_conf={float(_conf):.4f} centroid=({u},{v})',
-                        )
-                else:
-                    self.points.append((t, x, y, depth, u, v, bbox_area_px))
-                    if self._debug_ingest:
-                        self.get_logger().info(
-                            f'[bean_bag_sense_fast/ingest] COLLECTING {len(self.points)}/3: '
-                            f'nn_conf={float(_conf):.4f} centroid=({u},{v}) depth_m={depth:.4f}',
-                        )
-
-                    if len(self.points) >= self.required_points:
-                        _published, arm_keyboard = self.compute_and_publish()
-
-                        if arm_keyboard:
-                            self.state = 'WAIT'
-                            self._spawn_stdin_arm_thread()
-                        else:
-                            self.points.clear()
-                            self.state = 'IDLE'
-                            self._debug_first_frame_bgr = None
-                            self._prev_nn_centroid_depth = None
-
-            if not skip_prev_update:
-                self._prev_nn_centroid_depth = depth
-
-    def _spawn_stdin_arm_thread(self) -> None:
-        """Wait for a ``y`` line on stdin, then remaining publish cooldown; arm IDLE via poll timer."""
-        min_interval = self.min_publish_interval
-
-        def worker() -> None:
-            # Requires a TTY when launched with `ros2 run` in a terminal.
-            _wait_for_confirm_y_line()
-            rem = max(0.0, min_interval - (time.monotonic() - self._last_publish_mono))
-            if rem > 0:
-                time.sleep(rem)
+        if in_band:
             with self._state_lock:
-                self._pending_keyboard_reset = True
+                self._throw_buffer.append((t, x, y, depth, u, v, bbox_area_px))
+                self._last_valid_append_mono = time.monotonic()
+                # Cap buffer: drop oldest (throw front still ends with silence timeout on latest samples).
+                over = len(self._throw_buffer) - self._max_throw_buffer
+                if over > 0:
+                    del self._throw_buffer[:over]
+                    nowm = time.monotonic()
+                    if nowm - self._last_buffer_trim_log_mono > 2.0:
+                        self._last_buffer_trim_log_mono = nowm
+                        self.get_logger().warn(
+                            f'throw buffer exceeded max_throw_buffer_frames={self._max_throw_buffer}; '
+                            f'dropped {over} oldest sample(s).',
+                        )
+            if self._debug_ingest:
+                with self._state_lock:
+                    nb = len(self._throw_buffer)
+                self.get_logger().info(
+                    f'[bean_bag_sense_fast/ingest] buffered {nb} in-band: '
+                    f'nn_conf={float(_conf):.4f} centroid=({u},{v}) depth_m={depth:.4f}',
+                )
 
-        self._stdin_arm_thread = threading.Thread(target=worker, daemon=True)
-        self._stdin_arm_thread.start()
-
-    def _keyboard_poll_callback(self) -> None:
+    def _throw_silence_timer_callback(self) -> None:
+        """If the throw buffer has not grown for throw_silence_timeout_sec, finalize the throw."""
         with self._state_lock:
-            if not self._pending_keyboard_reset:
+            if not self._throw_buffer:
                 return
-            self._apply_idle_reset()
+            t_end = self._last_valid_append_mono
+            if t_end is None:
+                return
+            if time.monotonic() - t_end < self._throw_silence_timeout:
+                return
+            raw = list(self._throw_buffer)
+            self._throw_buffer.clear()
+            self._last_valid_append_mono = None
+        self._finalize_throw_from_buffer(raw)
 
-    def _apply_idle_reset(self) -> None:
-        """Clear wait flag and collection state; caller must hold ``_state_lock``."""
-        self._pending_keyboard_reset = False
-        self.state = 'IDLE'
-        self.points.clear()
-        self._debug_first_frame_bgr = None
-        self._prev_nn_centroid_depth = None
-
-    def compute_and_publish(self) -> tuple[bool, bool]:
-        """Fit trajectory, predict landing. Returns (published, arm_keyboard).
-
-        Delegates to :mod:`bean_bag_tracker.trajectory_common`.
-        """
-        first_bgr = (
-            self._debug_first_frame_bgr.copy()
-            if self._debug_first_frame_bgr is not None
-            else None
+    def _finalize_throw_from_buffer(self, raw: list[TrajectoryPoint]) -> None:
+        n = len(raw)
+        if n < 3:
+            self.get_logger().warn(
+                f'throw ended with only {n} in-band valid sample(s); need >= 3 for fit — discarding.',
+            )
+            return
+        three = self._middle_three(raw)
+        self.get_logger().info(
+            f'throw finalize: N={n} in-band → middle-3 of {3} (t_rel from first in triple follows in backtrack).',
         )
-        published, arm_keyboard, new_last = compute_and_publish_points(
-            points=self.points,
+        _, _, new_last = compute_and_publish_points(
+            points=three,
             depth_scale=self.depth_scale,
             hole_distance_m=self.hole_distance,
             max_publish_distance_m=self.max_publish_distance_m,
             min_publish_interval_sec=self.min_publish_interval,
             last_publish_mono=self._last_publish_mono,
             now_mono=time.monotonic(),
-            fx=self.fx,
-            fy=self.fy,
-            cx=self.cx,
-            cy=self.cy,
-            first_bgr=first_bgr,
             publisher=self.publisher.publish,
             result_topic=self.get_parameter('result_topic').value,
             log_info=self.get_logger().info,
             log_warn=self.get_logger().warn,
         )
         self._last_publish_mono = new_last
-        return (published, arm_keyboard)
 
 def main(args=None):
     rclpy.init(args=args)
