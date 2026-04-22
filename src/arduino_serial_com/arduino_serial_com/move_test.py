@@ -7,14 +7,14 @@ class QuadrantTestPublisher(Node):
     def __init__(self):
         super().__init__('quadrant_test_publisher')
         # Using the parameter-based topic name from your snippet
-        self.declare_parameter('result_topic', 'target_position')
+        self.declare_parameter('result_topic', '/bean_bag_trajectory')
         topic_name = self.get_parameter('result_topic').value
         
         self.publisher = self.create_publisher(Float32MultiArray, topic_name, 10)
         
         # Quadrant centers: 45, 135, 225, 315 degrees
         self.test_angles = [math.radians(a) for a in [45, 135, 225, 315]]
-        self.range_val = 0.5
+        self.range_val = 0.1
         self.index = 0
         
         # Publish every 2 seconds to allow for observation
