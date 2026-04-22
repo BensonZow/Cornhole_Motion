@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Red Ball Tracking and Horizontal Offset Publisher (ROS2)
-Terminal-controlled publishing: Enter toggles run/pause, 'q' quits, 's' pauses.
+Red Ball Tracking and Metric X Distance Publisher (ROS2)
+Uses RealSense depth + intrinsics to compute horizontal offset in meters.
+Publishes [x_distance_meters, radians] to 'bean_bag_tracker'.
 """
 
 import cv2
@@ -18,9 +19,12 @@ from typing import Optional, Tuple
 # ROS2 imports
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Float32MultiArray
 from cv_bridge import CvBridge
+
+# pyrealsense2 for deprojection
+import pyrealsense2 as rs
 
 # Configuration
 @dataclass
@@ -30,11 +34,13 @@ class Config:
     CAMERA_HEIGHT = 720
     FPS = 30
 
-    # ROS2 topic for RealSense color image
-    CAMERA_TOPIC = '/camera/camera/color/image_raw'
+    # ROS2 topics (adjust if needed)
+    COLOR_TOPIC = '/camera/camera/color/image_raw'
+    DEPTH_TOPIC = '/camera/camera/aligned_depth_to_color/image_raw'
+    CAMERA_INFO_TOPIC = '/camera/camera/color/camera_info'
 
-    # ROS2 topic for publishing offset data
-    OUTPUT_TOPIC = '/bean_bag_trajectory'
+    # Output topic
+    OUTPUT_TOPIC = 'bean_bag_tracker'
 
     # Red color detection (HSV ranges)
     RED_LOWER_1 = np.array([0, 120, 70])
@@ -59,42 +65,72 @@ class Config:
     PRINT_STATS = True
 
 class BallTrackerNode(Node):
-    """ROS2 Node that subscribes to camera and publishes offset data."""
+    """ROS2 Node that subscribes to color, depth, and camera info to compute metric X offset."""
 
     def __init__(self, config):
         super().__init__('ball_tracker_node')
         self.config = config
         self.bridge = CvBridge()
-        self.latest_frame = None
+
+        # Synchronized data storage
+        self.color_frame = None
+        self.depth_frame = None
+        self.camera_info = None
         self.frame_lock = threading.Lock()
-        self.new_frame_event = threading.Event()
+        self.new_color_event = threading.Event()
 
-        self.subscription = self.create_subscription(
-            Image, config.CAMERA_TOPIC, self.image_callback, 10)
-        self.get_logger().info(f"Subscribed to {config.CAMERA_TOPIC}")
+        # Subscribers
+        self.color_sub = self.create_subscription(
+            Image, config.COLOR_TOPIC, self.color_callback, 10)
+        self.depth_sub = self.create_subscription(
+            Image, config.DEPTH_TOPIC, self.depth_callback, 10)
+        self.info_sub = self.create_subscription(
+            CameraInfo, config.CAMERA_INFO_TOPIC, self.info_callback, 10)
 
+        self.get_logger().info(f"Subscribed to {config.COLOR_TOPIC}, {config.DEPTH_TOPIC}, {config.CAMERA_INFO_TOPIC}")
+
+        # Publisher
         self.publisher = self.create_publisher(Float32MultiArray, config.OUTPUT_TOPIC, 10)
         self.get_logger().info(f"Publishing to {config.OUTPUT_TOPIC}")
 
+        # Position tracking
         self.positions = deque(maxlen=config.SMOOTHING_WINDOW)
         self.velocities = deque(maxlen=config.PREDICTION_WINDOW)
+
         self.running = True
 
-    def image_callback(self, msg):
+    def color_callback(self, msg):
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             with self.frame_lock:
-                self.latest_frame = cv_image
-            self.new_frame_event.set()
+                self.color_frame = cv_image
+            self.new_color_event.set()
         except Exception as e:
-            self.get_logger().error(f"Image callback error: {e}")
+            self.get_logger().error(f"Color callback error: {e}")
 
-    def get_frame(self, timeout=1.0):
-        if self.new_frame_event.wait(timeout=timeout):
-            self.new_frame_event.clear()
+    def depth_callback(self, msg):
+        try:
+            # Depth is 16UC1 in millimeters
+            depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
             with self.frame_lock:
-                return self.latest_frame.copy() if self.latest_frame is not None else None
-        return None
+                self.depth_frame = depth_image
+        except Exception as e:
+            self.get_logger().error(f"Depth callback error: {e}")
+
+    def info_callback(self, msg):
+        with self.frame_lock:
+            self.camera_info = msg
+
+    def get_synchronized_data(self, timeout=1.0):
+        """Wait for a new color frame and return current color, depth, and intrinsics."""
+        if self.new_color_event.wait(timeout=timeout):
+            self.new_color_event.clear()
+            with self.frame_lock:
+                color = self.color_frame.copy() if self.color_frame is not None else None
+                depth = self.depth_frame.copy() if self.depth_frame is not None else None
+                info = self.camera_info
+            return color, depth, info
+        return None, None, None
 
     def detect_ball(self, frame):
         if frame is None:
@@ -124,6 +160,36 @@ class BallTrackerNode(Node):
 
         return (x, y, radius), red_mask
 
+    def pixel_to_metric_x(self, pixel_x, pixel_y, depth_frame, camera_info):
+        """
+        Convert pixel coordinates to metric X coordinate using RealSense deprojection.
+        Returns X in meters, or None if depth is invalid.
+        """
+        if depth_frame is None or camera_info is None:
+            return None
+
+        # Get depth value in millimeters
+        depth_mm = depth_frame[pixel_y, pixel_x]
+        if depth_mm == 0:
+            return None  # Invalid depth
+
+        # Build rs2_intrinsics from CameraInfo
+        intrinsics = rs.intrinsics()
+        intrinsics.width = camera_info.width
+        intrinsics.height = camera_info.height
+        intrinsics.ppx = camera_info.k[2]  # cx
+        intrinsics.ppy = camera_info.k[5]  # cy
+        intrinsics.fx = camera_info.k[0]
+        intrinsics.fy = camera_info.k[4]
+        # Assume Brown Conrady model with zero distortion for simplicity
+        intrinsics.model = rs.distortion.brown_conrady
+        intrinsics.coeffs = camera_info.d  # distortion coefficients
+
+        # Deproject pixel to point
+        point = rs.rs2_deproject_pixel_to_point(intrinsics, [pixel_x, pixel_y], depth_mm / 1000.0)
+        # point is [x, y, z] in meters
+        return point[0]  # X coordinate
+
     def predict_position(self, position: Tuple[int, int, int]) -> Tuple[int, int]:
         self.positions.append(position)
         if len(self.positions) < 2:
@@ -148,7 +214,7 @@ class BallTrackerNode(Node):
 
         return position[0], position[1]
 
-    def draw_detection(self, frame, ball_data, pred_position):
+    def draw_detection(self, frame, ball_data, pred_position, metric_x=None):
         if frame is None or ball_data is None:
             return frame
         x, y, radius = ball_data
@@ -158,9 +224,12 @@ class BallTrackerNode(Node):
         cv2.circle(frame, (pred_x, pred_y), 10, (255, 255, 0), 2)
         cv2.line(frame, (self.config.TARGET_X, 0),
                  (self.config.TARGET_X, self.config.CAMERA_HEIGHT), (255, 0, 0), 2)
+        if metric_x is not None:
+            cv2.putText(frame, f"X: {metric_x:.3f} m", (x+10, y-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         return frame
 
-    def draw_text(self, frame, ball_data, pred_position):
+    def draw_text(self, frame, ball_data, pred_position, metric_x=None):
         if frame is None:
             return frame
         if ball_data is not None:
@@ -170,24 +239,32 @@ class BallTrackerNode(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             cv2.putText(frame, f"Pred: ({pred_x}, {pred_y})", (10, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            if metric_x is not None:
+                cv2.putText(frame, f"Metric X: {metric_x:.3f} m", (10, 100),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         else:
             cv2.putText(frame, "No ball detected", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        cv2.putText(frame, f"Target X: {self.config.TARGET_X}", (10, 90),
+        cv2.putText(frame, f"Target X: {self.config.TARGET_X}", (10, 130),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         return frame
 
-    def process_frame(self, frame):
-        ball_data, mask = self.detect_ball(frame)
-        pred_x = pred_y = radius = None
-        annotated_frame = frame.copy() if frame is not None else None
+    def process_frame(self, color_frame, depth_frame, camera_info):
+        ball_data, mask = self.detect_ball(color_frame)
+        pred_x = pred_y = radius = metric_x = None
+        annotated_frame = color_frame.copy() if color_frame is not None else None
 
         if ball_data is not None:
             x, y, radius = ball_data
             pred_x, pred_y = self.predict_position((x, y, radius))
+
+            # Compute metric X using depth
+            if depth_frame is not None and camera_info is not None:
+                metric_x = self.pixel_to_metric_x(x, y, depth_frame, camera_info)
+
             if self.config.SHOW_VIDEO and annotated_frame is not None:
-                annotated_frame = self.draw_detection(annotated_frame, ball_data, (pred_x, pred_y))
-                annotated_frame = self.draw_text(annotated_frame, ball_data, (pred_x, pred_y))
+                annotated_frame = self.draw_detection(annotated_frame, ball_data, (pred_x, pred_y), metric_x)
+                annotated_frame = self.draw_text(annotated_frame, ball_data, (pred_x, pred_y), metric_x)
                 if mask is not None:
                     mask_resized = cv2.resize(mask, (160, 120))
                     mask_colored = cv2.cvtColor(mask_resized, cv2.COLOR_GRAY2BGR)
@@ -198,7 +275,7 @@ class BallTrackerNode(Node):
                 cv2.line(annotated_frame, (self.config.TARGET_X, 0),
                          (self.config.TARGET_X, self.config.CAMERA_HEIGHT), (255, 0, 0), 2)
 
-        return pred_x, pred_y, radius, annotated_frame
+        return pred_x, pred_y, radius, metric_x, annotated_frame
 
     def stop(self):
         self.running = False
@@ -219,16 +296,20 @@ class BallTrackerSystem:
         self.detection_count = 0
         self.start_time = time.time()
 
-    def calculate_offset_data(self, ball_x: float) -> Tuple[float, float]:
-        distance = abs(ball_x - self.config.TARGET_X)
-        radians = 0.0 if ball_x < self.config.TARGET_X else math.pi
+    def calculate_offset_data(self, metric_x: float) -> Tuple[float, float]:
+        """
+        Compute distance (absolute) and radians direction flag from metric X.
+        Since target is at X=0 in camera frame, distance = abs(metric_x).
+        Radians = 0.0 for negative X (left), pi for positive X (right).
+        """
+        distance = abs(metric_x)
+        radians = 0.0 if metric_x < 0.0 else math.pi
         return distance, radians
 
     def terminal_input_thread(self):
         """Thread to read commands from stdin."""
         print("Terminal commands: [Enter] = toggle publish, 's' = pause, 'q' = quit")
         while self.running:
-            # Check if there's input available (non-blocking)
             if select.select([sys.stdin], [], [], 0.1)[0]:
                 line = sys.stdin.readline().strip().lower()
                 if line == '':
@@ -249,12 +330,13 @@ class BallTrackerSystem:
 
     def run(self):
         print("=" * 60)
-        print("RED BALL OFFSET PUBLISHER (ROS2) - Terminal Control")
+        print("RED BALL METRIC X PUBLISHER (ROS2) - Terminal Control")
         print("=" * 60)
-        print(f"Input topic:  {self.config.CAMERA_TOPIC}")
+        print(f"Color topic:  {self.config.COLOR_TOPIC}")
+        print(f"Depth topic:  {self.config.DEPTH_TOPIC}")
+        print(f"Info topic:   {self.config.CAMERA_INFO_TOPIC}")
         print(f"Output topic: {self.config.OUTPUT_TOPIC}")
-        print(f"Camera: {self.config.CAMERA_WIDTH}x{self.config.CAMERA_HEIGHT} @ {self.config.FPS}FPS")
-        print("Publishes: [distance_from_center (px), radians (0.0 left, π right)]")
+        print("Publishes: [abs_x_meters, radians (0.0 left, π right)]")
         print("=" * 60)
         print("TERMINAL COMMANDS:")
         print("  [Enter]       : toggle publishing on/off")
@@ -263,7 +345,6 @@ class BallTrackerSystem:
         print("OpenCV window also accepts 'q' (quit) and SPACE (pause).")
         print("=" * 60)
 
-        # Start terminal input thread
         input_thread = threading.Thread(target=self.terminal_input_thread, daemon=True)
         input_thread.start()
 
@@ -274,18 +355,19 @@ class BallTrackerSystem:
                 rclpy.spin_once(self.tracker_node, timeout_sec=0.01)
                 frame_start_time = time.time()
 
-                frame = self.tracker_node.get_frame(timeout=0.1)
-                if frame is None:
+                # Get synchronized color, depth, and camera info
+                color, depth, info = self.tracker_node.get_synchronized_data(timeout=0.1)
+                if color is None:
                     time.sleep(0.01)
                     continue
 
-                ball_x, ball_y, radius, annotated_frame = self.tracker_node.process_frame(frame)
+                ball_x, ball_y, radius, metric_x, annotated_frame = self.tracker_node.process_frame(color, depth, info)
                 self.frame_count += 1
 
-                if ball_x is not None:
+                if ball_x is not None and metric_x is not None:
                     self.detection_count += 1
                     self.ball_detected = True
-                    distance, radians = self.calculate_offset_data(float(ball_x))
+                    distance, radians = self.calculate_offset_data(metric_x)
 
                     if self.publish_enabled:
                         msg = Float32MultiArray()
@@ -298,36 +380,31 @@ class BallTrackerSystem:
                         fps = self.frame_count / elapsed if elapsed > 0 else 0
                         detect_rate = (self.detection_count / self.frame_count) * 100 if self.frame_count > 0 else 0
                         mode_str = "PUBLISH" if self.publish_enabled else "PAUSE"
-                        side_str = "LEFT" if ball_x < self.config.TARGET_X else "RIGHT"
-                        print(f"[{mode_str}] FPS: {fps:.1f}, X: {int(ball_x)} ({side_str}), "
-                              f"Dist: {distance:.1f}, Rad: {radians:.2f}, Detect: {detect_rate:.1f}%")
+                        side_str = "LEFT" if metric_x < 0.0 else "RIGHT"
+                        print(f"[{mode_str}] FPS: {fps:.1f}, X: {metric_x:.3f} m ({side_str}), "
+                              f"Dist: {distance:.3f}, Rad: {radians:.2f}, Detect: {detect_rate:.1f}%")
                         last_print_time = current_time
                 else:
                     self.ball_detected = False
 
-                # OpenCV window handling
+                # OpenCV window
                 if self.config.SHOW_VIDEO and annotated_frame is not None:
                     mode_text = "MODE: PUBLISH" if self.publish_enabled else "MODE: PAUSE"
                     mode_color = (0, 255, 0) if self.publish_enabled else (0, 0, 255)
-                    cv2.putText(annotated_frame, mode_text, (10, 120),
+                    cv2.putText(annotated_frame, mode_text, (10, 160),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, mode_color, 2)
 
                     status = "BALL TRACKING" if self.ball_detected else "SEARCHING"
                     status_color = (0, 255, 0) if self.ball_detected else (0, 0, 255)
-                    cv2.putText(annotated_frame, f"Status: {status}", (10, 150),
+                    cv2.putText(annotated_frame, f"Status: {status}", (10, 190),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-
-                    if self.ball_detected and ball_x is not None:
-                        distance, radians = self.calculate_offset_data(float(ball_x))
-                        cv2.putText(annotated_frame, f"Dist: {distance:.1f} px, Rad: {radians:.2f}", (10, 180),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
                     frame_time = time.time() - frame_start_time
                     fps_disp = 1.0 / frame_time if frame_time > 0 else 0
-                    cv2.putText(annotated_frame, f"FPS: {fps_disp:.1f}", (10, 210),
+                    cv2.putText(annotated_frame, f"FPS: {fps_disp:.1f}", (10, 220),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-                    cv2.imshow("Ball Tracker - Offset Publisher", annotated_frame)
+                    cv2.imshow("Ball Tracker - Metric Offset", annotated_frame)
 
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord('q'):
