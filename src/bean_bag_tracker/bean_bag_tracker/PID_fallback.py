@@ -53,7 +53,7 @@ class Config:
     KD_X = 0.15     # Derivative gain
     
     # Motor control (serial)
-    SERIAL_PORT = '/dev/ttyUSB0'  # Adjust to your Arduino port
+    SERIAL_PORT = '/dev/ttyACM0'  # Adjust to your Arduino port
     SERIAL_BAUD = 115200
     
     # Motor limits
