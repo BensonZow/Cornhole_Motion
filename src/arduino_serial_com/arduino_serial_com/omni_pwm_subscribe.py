@@ -43,9 +43,6 @@ MOTOR_PERM: Tuple[int, int, int, int] = (0, 1, 2, 3)
 # Offsets for the four rows (radians) relative to ALPHA_RAD
 _WHEEL_ANGLE_OFFSETS = (0.0, math.pi / 2, -math.pi, -math.pi / 2)
 
-# After each non-zero drive command, wait then send 0,0,0,0 (CLI default; override with --stop-after)
-STOP_AFTER_COMMAND_S = 1.0
-
 
 class SpeedLimitDerived(NamedTuple):
     v_axial_max_m_s: float
@@ -59,11 +56,9 @@ class TrackerSubscriber(Node):
         super().__init__('tracker_subscriber')
         self.args = args
         self.ser = None
-        self.stop_timer = None
         self._comm_seq = 0
         self._last_comm_mono: float | None = None
 
-        # Use a Reentrant group so the timer and subscriber can run simultaneously
         self.callback_group = ReentrantCallbackGroup()
 
         # 1. Setup Serial once during initialization
@@ -161,51 +156,21 @@ class TrackerSubscriber(Node):
 
         self._comm_print("after_compute", pwms=str(pwms))
 
-        # 3. Execution (replaces _send_pwms)
         out = format_line(pwms)
-        if self.args.dry_run:
-            print(f"DRY RUN: {out.strip()}")
-        elif self.ser is not None:
-            self._comm_print("before_serial_drive", nbytes=len(out.encode("utf-8")))
-            t_drive = time.monotonic()
-            _send_drive_line_delayed_stop(self.ser, out, pwms, self.args.stop_after)
-            self._comm_print(
-                "after_serial_drive",
-                drive_block_ms=f"{(time.monotonic() - t_drive) * 1000.0:.3f}",
-            )
-            if self.args.stop_after > 0 and any(pwms):
-                self.get_logger().info(f"Sent command; stop scheduled in {self.args.stop_after}s")
-
-        # LOGGING: See if commands are actually being sent
         self.get_logger().debug(f"Sending PWM: {pwms}")
-        self._comm_print("before_send_to_serial")
-        self.send_to_serial(format_line(pwms))
-        self._try_read_serial_response()
-
-        # Reset the stop timer
-        if self.stop_timer:
-            self.stop_timer.cancel()
-
-        # Create timer in the reentrant group
-        self.stop_timer = self.create_timer(
-            self.args.stop_after,
-            self.timer_stop_callback,
-            callback_group=self.callback_group,
+        t_drive = time.monotonic()
+        self.send_to_serial(out)
+        self._comm_print(
+            "after_serial",
+            block_ms=f"{(time.monotonic() - t_drive) * 1000.0:.3f}",
         )
+        self._try_read_serial_response()
 
     def stop_motors_and_close(self):
         if self.ser is not None:
             send_motor_stop(self.ser)
             self.ser.close()
             self.get_logger().info("Serial port closed.")
-
-    def timer_stop_callback(self):
-        self.get_logger().info("!!! TIMER STOP TRIGGERED !!!")
-        self._comm_print("timer_stop_callback")
-        self.send_to_serial("0,0,0,0\n")
-        if self.stop_timer:
-            self.stop_timer.cancel()
-            self.stop_timer = None
 
     def send_to_serial(self, cmd: str):
         if self.args.dry_run:
@@ -293,14 +258,6 @@ def send_motor_stop(ser: serial.Serial):
     ser.write(b"0,0,0,0\n")
 
 
-def _send_drive_line_delayed_stop(ser: serial.Serial, line: str, pwms: List[int], delay: float):
-    """Sends the command and handles the stop-after timer."""
-    ser.write(line.encode("utf-8"))
-    if delay > 0 and any(pwms):
-        time.sleep(delay)
-        send_motor_stop(ser)
-
-
 def pwm_from_body_velocity(vx: float, vy: float, alpha_rad: float, pwm_ref_m_s: float) -> List[int]:
     """Converts x/y velocity to discrete PWM values [-255, 255]."""
     v_wheels = wheel_linear_velocities(vx, vy, alpha_rad)
@@ -322,7 +279,6 @@ def main(args=None):
     parser.add_argument("--speed-fraction", type=float, default=SPEED_LIMIT_FRACTION)
     parser.add_argument("--alpha", type=float, default=ALPHA_RAD)
     parser.add_argument("--pwm-ref", type=float, default=PWM_REF_WHEEL_M_S)
-    parser.add_argument("--stop-after", type=float, default=STOP_AFTER_COMMAND_S)
     parser.add_argument(
         "--heading-deg",
         type=float,
