@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
 """
-<<<<<<< HEAD
-Red Ball Tracking and Metric X Distance Publisher (ROS2)
-Uses RealSense depth + intrinsics to compute horizontal offset in meters.
-Publishes [x_distance_meters, radians] to 'bean_bag_tracker'.
-
-Terminal: h=help, d=debug (publish interval & frame→publish ms), p=one [PUB] line per message.
-=======
 Red Ball Tracking and Horizontal Offset Publisher (ROS2)
 Terminal-controlled publishing: Enter toggles run/pause, 'q' quits, 's' pauses.
->>>>>>> 186951d (Revert "Refactor PID_fallback.py for metric X distance tracking")
+
 """
 
 import cv2
@@ -228,21 +221,12 @@ class BallTrackerSystem:
         self.detection_count = 0
         self.start_time = time.time()
 
-        self._stats_lock = threading.Lock()
-        self._last_publish_mono: Optional[float] = None
-        self._inter_publish_ms: Deque[float] = deque(maxlen=30)
-        self._last_frame_to_pub_ms: float = 0.0
-        self._per_publish_log: bool = False
 
-    def calculate_offset_data(self, metric_x: float) -> Tuple[float, float]:
-        """
-        Compute distance (absolute) and radians direction flag from metric X.
-        Since target is at X=0 in camera frame, distance = abs(metric_x).
-        Radians = 0.0 for negative X (left), pi for positive X (right).
-        """
-        distance = abs(metric_x)
-        radians = 0.0 if metric_x < 0.0 else math.pi
-        return distance, radians
+    def calculate_offset_data(self, ball_x: float) -> Tuple[float, float]:
+        distance = abs(ball_x - self.config.TARGET_X)
+        radians = 0.0 if ball_x < self.config.TARGET_X else math.pi
+        return distance/1000, (radians + math.pi)
+
 
     def _print_terminal_help(self) -> None:
         print("Commands: [Enter]=toggle publish  s=pause  q=quit  h=help  d=debug  p=per-pub line")
