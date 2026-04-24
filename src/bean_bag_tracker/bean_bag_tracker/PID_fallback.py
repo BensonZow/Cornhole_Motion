@@ -352,7 +352,7 @@ class BallTrackerSystem:
 
         try:
             while self.running and rclpy.ok():
-                rclpy.spin_once(self.tracker_node, timeout_sec=0.01)
+                rclpy.spin_once(self.tracker_node, timeout_sec=0.1)
                 frame_start_time = time.time()
 
                 # Get synchronized color, depth, and camera info
