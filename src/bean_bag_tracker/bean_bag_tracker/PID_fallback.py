@@ -2,7 +2,6 @@
 """
 Red Ball Tracking and Horizontal Offset Publisher (ROS2)
 Terminal-controlled publishing: Enter toggles run/pause, 'q' quits, 's' pauses.
-
 """
 
 import cv2
@@ -14,8 +13,7 @@ import select
 from collections import deque
 from dataclasses import dataclass
 import math
-import statistics
-from typing import Deque, Optional, Tuple
+from typing import Optional, Tuple
 
 # ROS2 imports
 import rclpy
@@ -36,7 +34,7 @@ class Config:
     CAMERA_TOPIC = '/camera/camera/color/image_raw'
 
     # ROS2 topic for publishing offset data
-    OUTPUT_TOPIC = '/bean_bag_trajectory'
+    OUTPUT_TOPIC = 'bean_bag_trajectory'
 
     # Red color detection (HSV ranges)
     RED_LOWER_1 = np.array([0, 120, 70])
@@ -221,44 +219,14 @@ class BallTrackerSystem:
         self.detection_count = 0
         self.start_time = time.time()
 
-
     def calculate_offset_data(self, ball_x: float) -> Tuple[float, float]:
         distance = abs(ball_x - self.config.TARGET_X)
         radians = 0.0 if ball_x < self.config.TARGET_X else math.pi
-        return distance/1000, (radians + math.pi)
-
-
-    def _print_terminal_help(self) -> None:
-        print("Commands: [Enter]=toggle publish  s=pause  q=quit  h=help  d=debug  p=per-pub line")
-
-    def _print_debug_snapshot(self) -> None:
-        now = time.monotonic()
-        with self._stats_lock:
-            last_m = self._last_publish_mono
-            dts = list(self._inter_publish_ms)
-            f2p = self._last_frame_to_pub_ms
-            ppl = self._per_publish_log
-        age_ms = (now - last_m) * 1000.0 if last_m is not None else None
-        n = len(dts)
-        if n > 0:
-            mn, mx, avg = min(dts), max(dts), statistics.mean(dts)
-            inter = f"n={n} min_ms={mn:.2f} max_ms={mx:.2f} mean_ms={avg:.2f}"
-        else:
-            inter = "n=0 (no inter-publish samples yet)"
-        det = self.ball_detected
-        pe = self.publish_enabled
-        print("--- [DEBUG] publish pipeline ---")
-        print(f"  publish_enabled={pe!r}  ball_detected={det!r}  per_pub_log={ppl!r}")
-        if last_m is not None:
-            print(f"  last_publish_mono_s={last_m:.6f}  age_ms={age_ms:.2f}")
-        else:
-            print("  last publish: (never while stats collected)")
-        print(f"  inter_publish_ms: {inter}")
-        print(f"  last frame_start→publish_ms: {f2p:.2f} (most recent loop with a publish)")
+        return distance, (radians + math.pi)
 
     def terminal_input_thread(self):
         """Thread to read commands from stdin."""
-        print("Terminal: Enter=toggle  s=pause  h=help  d=debug  p=per-pub  q=quit")
+        print("Terminal commands: [Enter] = toggle publish, 's' = pause, 'q' = quit")
         while self.running:
             # Check if there's input available (non-blocking)
             if select.select([sys.stdin], [], [], 0.1)[0]:
@@ -274,20 +242,8 @@ class BallTrackerSystem:
                 elif line == 's':
                     self.publish_enabled = False
                     print("Publishing PAUSED")
-                elif line in ("h", "?"):
-                    self._print_terminal_help()
-                elif line == "d":
-                    self._print_debug_snapshot()
-                elif line == "p":
-                    with self._stats_lock:
-                        self._per_publish_log = not self._per_publish_log
-                        on = self._per_publish_log
-                    print(f"Per-publish one-liner: {'ON' if on else 'OFF'}")
                 else:
-                    print(
-                        f"Unknown command: '{line}'. Use Enter, s, q, h, d, p "
-                        f"(or run 'h' for help)."
-                    )
+                    print(f"Unknown command: '{line}'. Use Enter, 's', or 'q'.")
             else:
                 time.sleep(0.05)
 
@@ -303,9 +259,6 @@ class BallTrackerSystem:
         print("TERMINAL COMMANDS:")
         print("  [Enter]       : toggle publishing on/off")
         print("  's' + Enter   : pause publishing")
-        print("  'h' or '?'    : help (short list)")
-        print("  'd' + Enter   : debug snapshot (publish interval & frame→publish ms)")
-        print("  'p' + Enter   : toggle one line per [PUB] on each publish")
         print("  'q' + Enter   : quit")
         print("OpenCV window also accepts 'q' (quit) and SPACE (pause).")
         print("=" * 60)
@@ -318,8 +271,7 @@ class BallTrackerSystem:
 
         try:
             while self.running and rclpy.ok():
-                rclpy.spin_once(self.tracker_node, timeout_sec=0.1)
-                frame_start_mono = time.monotonic()
+                rclpy.spin_once(self.tracker_node, timeout_sec=0.01)
                 frame_start_time = time.time()
 
                 frame = self.tracker_node.get_frame(timeout=0.1)
@@ -336,24 +288,9 @@ class BallTrackerSystem:
                     distance, radians = self.calculate_offset_data(float(ball_x))
 
                     if self.publish_enabled:
-                        t_pub = time.monotonic()
-                        f2p_ms = (t_pub - frame_start_mono) * 1000.0
-                        inter_ms = 0.0
-                        with self._stats_lock:
-                            if self._last_publish_mono is not None:
-                                inter_ms = (t_pub - self._last_publish_mono) * 1000.0
-                                self._inter_publish_ms.append(inter_ms)
-                            self._last_publish_mono = t_pub
-                            self._last_frame_to_pub_ms = f2p_ms
-                            do_log = self._per_publish_log
                         msg = Float32MultiArray()
                         msg.data = [distance, radians]
                         self.tracker_node.publisher.publish(msg)
-                        if do_log:
-                            print(
-                                f"[PUB] mono_s={t_pub:.6f} inter_ms={inter_ms:.2f} "
-                                f"f2p_ms={f2p_ms:.2f} dist={distance:.3f} rad={radians:.2f}"
-                            )
 
                     current_time = time.time()
                     if current_time - last_print_time > 1.0 and self.config.PRINT_STATS:
